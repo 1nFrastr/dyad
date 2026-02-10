@@ -164,6 +164,7 @@ export async function handleLocalAgentStream(
     dyadRequestId,
     readOnly = false,
     planModeOnly = false,
+    skipProCheck = false,
     messageOverride,
   }: {
     placeholderMessageId: number;
@@ -180,6 +181,11 @@ export async function handleLocalAgentStream(
      */
     planModeOnly?: boolean;
     /**
+     * If true, do not enforce Dyad Pro / Basic Agent mode gate.
+     * Used by build mode migration to Claude Code runtime.
+     */
+    skipProCheck?: boolean;
+    /**
      * If provided, use these messages instead of fetching from the database.
      * Used for summarization where messages need to be transformed.
      */
@@ -191,7 +197,12 @@ export async function handleLocalAgentStream(
   // Check Pro status or Basic Agent mode
   // Basic Agent mode allows non-Pro users with quota (quota check is done in chat_stream_handlers)
   // Read-only mode (ask mode) is allowed for all users without Pro
-  if (!readOnly && !isDyadProEnabled(settings) && !isBasicAgentMode(settings)) {
+  if (
+    !skipProCheck &&
+    !readOnly &&
+    !isDyadProEnabled(settings) &&
+    !isBasicAgentMode(settings)
+  ) {
     safeSend(event.sender, "chat:response:error", {
       chatId: req.chatId,
       error:
@@ -288,6 +299,17 @@ export async function handleLocalAgentStream(
       ...(readOnly ? readOnlyDisallowed : []),
       ...(planModeOnly ? PLAN_MODE_DISALLOWED_TOOLS : []),
     ];
+    const claudeExecutablePath = resolveClaudeCodeExecutablePath();
+    const runtimeMode = readOnly
+      ? "ask"
+      : planModeOnly
+        ? "plan"
+        : skipProCheck
+          ? "build"
+          : "agent";
+    logger.log(
+      `[cc-runtime] start chatId=${req.chatId} mode=${runtimeMode} model=${settings.selectedModel.name} cwd=${appPath} executable=${claudeExecutablePath}`,
+    );
 
     let inThinkingBlock = false;
     let hasStreamedText = false;
@@ -305,7 +327,7 @@ export async function handleLocalAgentStream(
       prompt: conversationPrompt || req.prompt,
       options: {
         cwd: appPath,
-        pathToClaudeCodeExecutable: resolveClaudeCodeExecutablePath(),
+        pathToClaudeCodeExecutable: claudeExecutablePath,
         abortController,
         model: settings.selectedModel.name,
         maxTurns: 25,
@@ -318,7 +340,12 @@ export async function handleLocalAgentStream(
         systemPrompt: {
           type: "preset",
           preset: "claude_code",
-          append: systemPrompt,
+          append: `${systemPrompt}
+
+RUNTIME RULES:
+- If you need to modify files, perform edits via Claude Code tools directly.
+- Do not rely on dyad XML patch tags (<dyad-write>, <dyad-edit>, etc.) as the execution mechanism.
+- Only use tags in plain text when the user explicitly asks for tag examples.`,
         },
         canUseTool: async (toolName, input, options) => {
           const isMcpTool = toolName.startsWith("mcp__");
@@ -448,6 +475,14 @@ export async function handleLocalAgentStream(
         continue;
       }
 
+      if (part.type === "system" && (part as any).subtype === "init") {
+        const initPart: any = part;
+        logger.log(
+          `[cc-runtime] init claude_code_version=${initPart.claude_code_version ?? "unknown"} model=${initPart.model ?? "unknown"} permissionMode=${initPart.permissionMode ?? "unknown"} tools=${Array.isArray(initPart.tools) ? initPart.tools.length : 0}`,
+        );
+        continue;
+      }
+
       if (part.type === "assistant" && !hasStreamedText) {
         const contentParts: any[] = (part as any).message?.content ?? [];
         for (const content of contentParts) {
@@ -470,6 +505,9 @@ export async function handleLocalAgentStream(
           result: (part as any).result,
           errors: (part as any).errors,
         };
+        logger.log(
+          `[cc-runtime] result subtype=${latestResult.subtype} inputTokens=${latestResult.usage?.inputTokens ?? 0} outputTokens=${latestResult.usage?.outputTokens ?? 0}`,
+        );
       }
     }
 

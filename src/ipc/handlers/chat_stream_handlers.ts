@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from "uuid";
-import { ipcMain, IpcMainInvokeEvent } from "electron";
+import { ipcMain } from "electron";
 import { createTypedHandler } from "./base";
 import { chatContracts } from "../types/chat";
 import {
@@ -11,7 +11,6 @@ import {
   TextStreamPart,
   stepCountIs,
   hasToolCall,
-  type ToolExecutionOptions,
 } from "ai";
 
 import { db } from "../../db";
@@ -59,8 +58,6 @@ import { getMaxTokens, getTemperature } from "../utils/token_utils";
 import { MAX_CHAT_TURNS_IN_CONTEXT } from "@/constants/settings_constants";
 import { validateChatContext } from "../utils/context_paths_utils";
 import { getProviderOptions, getAiHeaders } from "../utils/provider_options";
-import { mcpServers } from "../../db/schema";
-import { requireMcpToolConsent } from "../utils/mcp_consent";
 
 import { handleLocalAgentStream } from "../../pro/main/ipc/handlers/local_agent/local_agent_handler";
 
@@ -84,8 +81,6 @@ import { prompts as promptsTable } from "../../db/schema";
 import { inArray } from "drizzle-orm";
 import { replacePromptReference } from "../utils/replacePromptReference";
 import { parsePlanFile, validatePlanId } from "./planUtils";
-import { mcpManager } from "../utils/mcp_manager";
-import z from "zod";
 import {
   isBasicAgentMode,
   isSupabaseConnected,
@@ -571,9 +566,14 @@ ${componentSnippet}
           updatedChat.app.id, // Exclude current app
         );
         const willUseLocalAgentStream =
-          (settings.selectedChatMode === "local-agent" ||
-            settings.selectedChatMode === "ask") &&
-          !mentionedAppsCodebases.length;
+          settings.selectedChatMode === "build" ||
+          settings.selectedChatMode === "local-agent" ||
+          settings.selectedChatMode === "ask" ||
+          settings.selectedChatMode === "plan" ||
+          settings.selectedChatMode === "agent";
+        logger.log(
+          `chat mode routing: mode=${settings.selectedChatMode}, localAgentRuntime=${willUseLocalAgentStream}`,
+        );
 
         const isDeepContextEnabled =
           isEngineEnabled &&
@@ -1080,13 +1080,37 @@ This conversation includes one or more image attachments. When the user uploads 
           return fullResponse;
         };
 
+        // Handle build mode via Claude Code runtime.
+        if (settings.selectedChatMode === "build") {
+          const ccBuildSystemPrompt = `${systemPrompt}
+
+IMPORTANT RUNTIME INSTRUCTION:
+- You are running with Claude Code tool runtime.
+- Do NOT output <dyad-write>, <dyad-edit>, <dyad-search-replace>, <dyad-delete>, or any other dyad XML tags as the primary way to make changes.
+- Make all code/file changes by directly using Claude Code tools (Read/Edit/Write/MultiEdit/Bash as needed).
+- After edits, briefly summarize what you changed.`;
+          const streamSuccess = await handleLocalAgentStream(
+            event,
+            req,
+            abortController,
+            {
+              placeholderMessageId: placeholderAssistantMessage.id,
+              systemPrompt: ccBuildSystemPrompt,
+              dyadRequestId: dyadRequestId ?? "[no-request-id]",
+              skipProCheck: true,
+              messageOverride: chatMessages,
+            },
+          );
+          if (!streamSuccess) {
+            logger.warn("Build mode local runtime did not complete successfully");
+          }
+          return;
+        }
+
         // Handle ask mode: use local-agent in read-only mode
         // This gives users access to code reading tools while in ask mode
         // Ask mode does not consume free agent quota
-        if (
-          settings.selectedChatMode === "ask" &&
-          !mentionedAppsCodebases.length
-        ) {
+        if (settings.selectedChatMode === "ask") {
           // Reconstruct system prompt for local-agent read-only mode
           const readOnlySystemPrompt = constructSystemPrompt({
             aiRules,
@@ -1114,7 +1138,7 @@ This conversation includes one or more image attachments. When the user uploads 
               systemPrompt: readOnlySystemPrompt,
               dyadRequestId: dyadRequestId ?? "[no-request-id]",
               readOnly: true,
-              messageOverride: isSummarizeIntent ? chatMessages : undefined,
+              messageOverride: chatMessages,
             },
           );
           if (!streamSuccess) {
@@ -1127,10 +1151,7 @@ This conversation includes one or more image attachments. When the user uploads 
 
         // Handle plan mode: use local-agent with plan tools only
         // Plan mode is for requirements gathering and creating implementation plans
-        if (
-          settings.selectedChatMode === "plan" &&
-          !mentionedAppsCodebases.length
-        ) {
+        if (settings.selectedChatMode === "plan") {
           // Reconstruct system prompt for plan mode
           const planModeSystemPrompt = constructSystemPrompt({
             aiRules,
@@ -1144,18 +1165,13 @@ This conversation includes one or more image attachments. When the user uploads 
             systemPrompt: planModeSystemPrompt,
             dyadRequestId: dyadRequestId ?? "[no-request-id]",
             planModeOnly: true,
-            messageOverride: isSummarizeIntent ? chatMessages : undefined,
+            messageOverride: chatMessages,
           });
           return;
         }
 
         // Handle local-agent mode (Agent v2)
-        // Mentioned apps can't be handled by the local agent (defer to balanced smart context
-        // in build mode)
-        if (
-          settings.selectedChatMode === "local-agent" &&
-          !mentionedAppsCodebases.length
-        ) {
+        if (settings.selectedChatMode === "local-agent") {
           // Check quota for Basic Agent mode (non-Pro users)
           const isBasicAgentModeRequest = isBasicAgentMode(settings);
           if (isBasicAgentModeRequest) {
@@ -1189,7 +1205,7 @@ This conversation includes one or more image attachments. When the user uploads 
                 placeholderMessageId: placeholderAssistantMessage.id,
                 systemPrompt,
                 dyadRequestId: dyadRequestId ?? "[no-request-id]",
-                messageOverride: isSummarizeIntent ? chatMessages : undefined,
+                messageOverride: chatMessages,
               },
             );
           } finally {
@@ -1202,46 +1218,23 @@ This conversation includes one or more image attachments. When the user uploads 
           return;
         }
 
+        // Handle agent mode via Claude Code runtime as well.
         if (settings.selectedChatMode === "agent") {
-          const tools = await getMcpTools(event);
-
-          const { fullStream } = await simpleStreamText({
-            chatMessages: limitedHistoryChatMessages,
-            modelClient,
-            tools: {
-              ...tools,
-              "generate-code": {
-                description:
-                  "ALWAYS use this tool whenever generating or editing code for the codebase.",
-                inputSchema: z.object({}),
-                execute: async () => "",
-              },
-            },
-            systemPromptOverride: constructSystemPrompt({
-              aiRules: await readAiRules(getDyadAppPath(updatedChat.app.path)),
-              chatMode: "agent",
-              enableTurboEditsV2: false,
-            }),
-            files: files,
-            dyadDisableFiles: true,
-          });
-
-          const result = await processStreamChunks({
-            fullStream,
-            fullResponse,
+          const streamSuccess = await handleLocalAgentStream(
+            event,
+            req,
             abortController,
-            chatId: req.chatId,
-            processResponseChunkUpdate,
-          });
-          fullResponse = result.fullResponse;
-          chatMessages.push({
-            role: "assistant",
-            content: fullResponse,
-          });
-          chatMessages.push({
-            role: "user",
-            content: "OK.",
-          });
+            {
+              placeholderMessageId: placeholderAssistantMessage.id,
+              systemPrompt,
+              dyadRequestId: dyadRequestId ?? "[no-request-id]",
+              messageOverride: chatMessages,
+            },
+          );
+          if (!streamSuccess) {
+            logger.warn("Agent mode local runtime did not complete successfully");
+          }
+          return;
         }
 
         // When calling streamText, the messages need to be properly formatted for mixed content
@@ -1262,10 +1255,7 @@ This conversation includes one or more image attachments. When the user uploads 
           });
           fullResponse = result.fullResponse;
 
-          if (
-            settings.selectedChatMode !== "ask" &&
-            isTurboEditsV2Enabled(settings)
-          ) {
+          if (isTurboEditsV2Enabled(settings)) {
             let issues = await dryRunSearchReplace({
               fullResponse,
               appPath: getDyadAppPath(updatedChat.app.path),
@@ -1364,7 +1354,6 @@ ${formattedSearchReplaceIssues}`,
 
           if (
             !abortController.signal.aborted &&
-            settings.selectedChatMode !== "ask" &&
             hasUnclosedDyadWrite(fullResponse)
           ) {
             let continuationAttempts = 0;
@@ -1409,8 +1398,7 @@ ${formattedSearchReplaceIssues}`,
             // because there's going to be type errors since the packages aren't
             // installed yet.
             addDependencies.length === 0 &&
-            settings.enableAutoFixProblems &&
-            settings.selectedChatMode !== "ask"
+            settings.enableAutoFixProblems
           ) {
             try {
               // IF auto-fix is enabled
@@ -1893,48 +1881,4 @@ These are the other apps that I've mentioned in my prompt. These other apps' cod
 
 ${otherAppsCodebaseInfo}
 `;
-}
-
-async function getMcpTools(event: IpcMainInvokeEvent): Promise<ToolSet> {
-  const mcpToolSet: ToolSet = {};
-  try {
-    const servers = await db
-      .select()
-      .from(mcpServers)
-      .where(eq(mcpServers.enabled, true as any));
-    for (const s of servers) {
-      const client = await mcpManager.getClient(s.id);
-      const toolSet = await client.tools();
-      for (const [name, mcpTool] of Object.entries(toolSet)) {
-        const key = `${String(s.name || "").replace(/[^a-zA-Z0-9_-]/g, "-")}__${String(name).replace(/[^a-zA-Z0-9_-]/g, "-")}`;
-        mcpToolSet[key] = {
-          description: mcpTool.description,
-          inputSchema: mcpTool.inputSchema,
-          execute: async (args: unknown, execCtx: ToolExecutionOptions) => {
-            const inputPreview =
-              typeof args === "string"
-                ? args
-                : Array.isArray(args)
-                  ? args.join(" ")
-                  : JSON.stringify(args).slice(0, 500);
-            const ok = await requireMcpToolConsent(event, {
-              serverId: s.id,
-              serverName: s.name,
-              toolName: name,
-              toolDescription: mcpTool.description,
-              inputPreview,
-            });
-
-            if (!ok) throw new Error(`User declined running tool ${key}`);
-            const res = await mcpTool.execute(args, execCtx);
-
-            return typeof res === "string" ? res : JSON.stringify(res);
-          },
-        };
-      }
-    }
-  } catch (e) {
-    logger.warn("Failed building MCP toolset", e);
-  }
-  return mcpToolSet;
 }
