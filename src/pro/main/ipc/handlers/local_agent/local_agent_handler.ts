@@ -94,6 +94,79 @@ function serializeMaybeJson(value: unknown): string {
   }
 }
 
+function truncateText(value: string, max = 1500): string {
+  if (value.length <= max) {
+    return value;
+  }
+  return `${value.slice(0, max)}\n... [truncated]`;
+}
+
+function getInputPath(input: Record<string, unknown>): string {
+  const candidates = [
+    input.file_path,
+    input.path,
+    input.target_file,
+    input.directory,
+  ];
+  for (const v of candidates) {
+    if (typeof v === "string" && v.trim().length > 0) {
+      return v;
+    }
+  }
+  return "";
+}
+
+function buildPrettyToolCallXml(
+  toolName: string,
+  input: Record<string, unknown>,
+): string {
+  const path = getInputPath(input);
+  switch (toolName) {
+    case "Read":
+      return `<dyad-read path="${escapeXmlAttr(path)}"></dyad-read>\n`;
+    case "Write": {
+      const content = typeof input.content === "string" ? input.content : "";
+      return `<dyad-write path="${escapeXmlAttr(path)}" description="Write file with Claude Code runtime">${escapeXmlContent(truncateText(content))}</dyad-write>\n`;
+    }
+    case "Edit": {
+      const content = serializeMaybeJson({
+        old_string: input.old_string,
+        new_string: input.new_string,
+        replace_all: input.replace_all,
+      });
+      return `<dyad-edit path="${escapeXmlAttr(path)}" description="Edit file with Claude Code runtime">${escapeXmlContent(truncateText(content))}</dyad-edit>\n`;
+    }
+    case "MultiEdit": {
+      const content = serializeMaybeJson({
+        edits: input.edits,
+      });
+      return `<dyad-edit path="${escapeXmlAttr(path)}" description="Multi-edit file with Claude Code runtime">${escapeXmlContent(truncateText(content))}</dyad-edit>\n`;
+    }
+    case "Grep": {
+      const query =
+        typeof input.pattern === "string"
+          ? input.pattern
+          : typeof input.query === "string"
+            ? input.query
+            : "";
+      const include =
+        typeof input.include === "string"
+          ? input.include
+          : typeof input.glob === "string"
+            ? input.glob
+            : "";
+      return `<dyad-grep query="${escapeXmlAttr(query)}" include="${escapeXmlAttr(include)}" state="finished"></dyad-grep>\n`;
+    }
+    case "Glob":
+    case "LS":
+      return `<dyad-list-files directory="${escapeXmlAttr(path || ".")}" recursive="true" state="finished"></dyad-list-files>\n`;
+    default: {
+      const toolInput = serializeMaybeJson(input);
+      return `<dyad-mcp-tool-call server="local" tool="${escapeXmlAttr(toolName)}">\n${escapeXmlContent(truncateText(toolInput))}\n</dyad-mcp-tool-call>\n`;
+    }
+  }
+}
+
 function buildConversationPromptFromDbMessages(
   history: Array<{ role: "user" | "assistant"; content: string }>,
 ): string {
@@ -394,9 +467,10 @@ RUNTIME RULES:
               hooks: [
                 async (input: any) => {
                   const toolName = input?.tool_name ?? "unknown";
-                  const toolInput = serializeMaybeJson(input?.tool_input);
+                  const toolInput =
+                    (input?.tool_input as Record<string, unknown>) ?? {};
                   await appendChunk(
-                    `<dyad-mcp-tool-call server="local" tool="${escapeXmlAttr(toolName)}">\n${escapeXmlContent(toolInput)}\n</dyad-mcp-tool-call>\n`,
+                    buildPrettyToolCallXml(toolName, toolInput),
                   );
                   return { continue: true };
                 },
@@ -406,14 +480,7 @@ RUNTIME RULES:
           PostToolUse: [
             {
               hooks: [
-                async (input: any) => {
-                  const toolName = input?.tool_name ?? "unknown";
-                  const toolOutput = serializeMaybeJson(input?.tool_response);
-                  await appendChunk(
-                    `<dyad-mcp-tool-result server="local" tool="${escapeXmlAttr(toolName)}">\n${escapeXmlContent(toolOutput)}\n</dyad-mcp-tool-result>\n`,
-                  );
-                  return { continue: true };
-                },
+                async () => ({ continue: true }),
               ],
             },
           ],
