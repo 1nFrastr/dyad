@@ -19,6 +19,36 @@ export interface InjectedMessage {
 }
 
 /**
+ * Normalize an image URL string so it is not double-encoded.
+ * When tool output or persistence encodes the URL (e.g. encodeURIComponent),
+ * the AI receives a wrong address. Decode once so new URL() gets a valid URL.
+ * Uses decodeURIComponent for whole-URL encoding (e.g. https%3A%2F%2F...);
+ * decodeURI does not decode reserved chars like : and /.
+ */
+function normalizeImageUrl(url: string): string {
+  const trimmed = url.trim();
+  if (!trimmed) return trimmed;
+  // Explicitly detect whole-URL encoding (works even when URL parser is lenient).
+  if (/^https?%3A/i.test(trimmed) || trimmed.includes("%253")) {
+    try {
+      return decodeURIComponent(trimmed);
+    } catch {
+      return trimmed;
+    }
+  }
+  try {
+    new URL(trimmed);
+    return trimmed;
+  } catch {
+    try {
+      return decodeURIComponent(trimmed);
+    } catch {
+      return trimmed;
+    }
+  }
+}
+
+/**
  * Transform a UserMessageContentPart to the format expected by the AI SDK.
  */
 export function transformContentPart(
@@ -27,8 +57,9 @@ export function transformContentPart(
   if (part.type === "text") {
     return { type: "text", text: part.text };
   }
-  // part.type === "image-url"
-  return { type: "image", image: new URL(part.url) };
+  // part.type === "image-url" — normalize to avoid urlencode issues so the AI gets the correct address
+  const urlString = normalizeImageUrl(part.url);
+  return { type: "image", image: new URL(urlString) };
 }
 
 /**

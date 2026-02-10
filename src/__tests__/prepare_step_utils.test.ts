@@ -48,6 +48,18 @@ describe("prepare_step_utils", () => {
         "https://example.com/image.png?width=100&height=200",
       );
     });
+
+    it("normalizes urlencoded image URLs so the AI gets the correct address", () => {
+      const part: UserMessageContentPart = {
+        type: "image-url",
+        url: "https%3A%2F%2Fexample.com%2Fscreenshot.png",
+      };
+      const result = transformContentPart(part);
+
+      expect((result as { type: "image"; image: URL }).image.href).toBe(
+        "https://example.com/screenshot.png",
+      );
+    });
   });
 
   describe("processPendingMessages", () => {
