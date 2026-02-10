@@ -93,7 +93,10 @@ function buildTestSettings(
   } = {},
 ) {
   const baseSettings = {
-    selectedModel: overrides.selectedModel ?? "gpt-4",
+    selectedModel: {
+      apiName: overrides.selectedModel ?? "claude-sonnet-4-5",
+      name: "Claude Sonnet",
+    },
   };
 
   if (overrides.enableDyadPro && overrides.hasApiKey !== false) {
@@ -114,23 +117,15 @@ function buildTestSettings(
 /**
  * Creates an async iterable that yields stream parts for testing
  */
-function createFakeStream(
-  parts: Array<{
-    type: string;
-    text?: string;
-    id?: string;
-    toolName?: string;
-    delta?: string;
-    [key: string]: unknown;
-  }>,
-) {
+function createFakeQueryStream(parts: Array<Record<string, unknown>>) {
+  async function* iterator() {
+    for (const part of parts) {
+      yield part;
+    }
+  }
   return {
-    fullStream: (async function* () {
-      for (const part of parts) {
-        yield part;
-      }
-    })(),
-    response: Promise.resolve({ messages: [] }),
+    [Symbol.asyncIterator]: iterator,
+    close: vi.fn(),
   };
 }
 
@@ -205,39 +200,10 @@ vi.mock("@/ipc/utils/safe_sender", () => ({
   }),
 }));
 
-let mockStreamResult: ReturnType<typeof createFakeStream> | null = null;
+let mockQueryResult: ReturnType<typeof createFakeQueryStream> | null = null;
 
-vi.mock("ai", () => ({
-  streamText: vi.fn(() => mockStreamResult),
-  stepCountIs: vi.fn((n: number) => ({ steps: n })),
-  hasToolCall: vi.fn((toolName: string) => ({ toolName })),
-}));
-
-vi.mock("@/ipc/utils/get_model_client", () => ({
-  getModelClient: vi.fn(async () => ({
-    modelClient: {
-      model: { id: "test-model" },
-      builtinProviderId: "openai",
-    },
-  })),
-}));
-
-vi.mock("@/ipc/utils/token_utils", () => ({
-  getMaxTokens: vi.fn(async () => 4096),
-  getTemperature: vi.fn(async () => 0.7),
-}));
-
-vi.mock("@/ipc/utils/provider_options", () => ({
-  getProviderOptions: vi.fn(() => ({})),
-  getAiHeaders: vi.fn(() => ({})),
-}));
-
-vi.mock("@/ipc/utils/mcp_manager", () => ({
-  mcpManager: {
-    getClient: vi.fn(async () => ({
-      tools: vi.fn(async () => ({})),
-    })),
-  },
+vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
+  query: vi.fn(() => mockQueryResult),
 }));
 
 vi.mock("@/pro/main/ipc/handlers/local_agent/tool_definitions", () => ({
@@ -273,7 +239,7 @@ describe("handleLocalAgentStream", () => {
     dbOperations.queries = [];
     mockChatData = null;
     mockSettings = buildTestSettings();
-    mockStreamResult = null;
+    mockQueryResult = null;
   });
 
   describe("Pro status validation", () => {
@@ -381,9 +347,26 @@ describe("handleLocalAgentStream", () => {
       mockChatData = buildTestChat({
         messages: [{ id: 1, role: "user", content: "Hello" }],
       });
-      mockStreamResult = createFakeStream([
-        { type: "text-delta", text: "Hello, " },
-        { type: "text-delta", text: "world!" },
+      mockQueryResult = createFakeQueryStream([
+        {
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            delta: { type: "text_delta", text: "Hello, " },
+          },
+        },
+        {
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            delta: { type: "text_delta", text: "world!" },
+          },
+        },
+        {
+          type: "result",
+          subtype: "success",
+          usage: { inputTokens: 10, outputTokens: 15 },
+        },
       ]);
 
       // Act
@@ -428,11 +411,30 @@ describe("handleLocalAgentStream", () => {
       const { event } = createFakeEvent();
       mockSettings = buildTestSettings({ enableDyadPro: true });
       mockChatData = buildTestChat();
-      mockStreamResult = createFakeStream([
-        { type: "reasoning-start" },
-        { type: "reasoning-delta", text: "Let me think..." },
-        { type: "reasoning-end" },
-        { type: "text-delta", text: "Here is my answer." },
+      mockQueryResult = createFakeQueryStream([
+        {
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            delta: { type: "thinking_delta", thinking: "Let me think..." },
+          },
+        },
+        {
+          type: "stream_event",
+          event: { type: "content_block_stop" },
+        },
+        {
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            delta: { type: "text_delta", text: "Here is my answer." },
+          },
+        },
+        {
+          type: "result",
+          subtype: "success",
+          usage: { inputTokens: 5, outputTokens: 8 },
+        },
       ]);
 
       // Act
@@ -467,9 +469,26 @@ describe("handleLocalAgentStream", () => {
       mockSettings = buildTestSettings({ enableDyadPro: true });
       mockChatData = buildTestChat();
       // Simulate reasoning-delta without explicit reasoning-end before text
-      mockStreamResult = createFakeStream([
-        { type: "reasoning-delta", text: "Thinking here" },
-        { type: "text-delta", text: "Answer" },
+      mockQueryResult = createFakeQueryStream([
+        {
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            delta: { type: "thinking_delta", thinking: "Thinking here" },
+          },
+        },
+        {
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            delta: { type: "text_delta", text: "Answer" },
+          },
+        },
+        {
+          type: "result",
+          subtype: "success",
+          usage: { inputTokens: 5, outputTokens: 8 },
+        },
       ]);
 
       // Act
@@ -512,17 +531,25 @@ describe("handleLocalAgentStream", () => {
       const abortController = new AbortController();
 
       // Create a stream that will be aborted mid-way
-      let yieldCount = 0;
-      mockStreamResult = {
-        fullStream: (async function* () {
-          yield { type: "text-delta", text: "First " };
-          yieldCount++;
-          // Abort after first chunk
+      mockQueryResult = {
+        [Symbol.asyncIterator]: async function* () {
+          yield {
+            type: "stream_event",
+            event: {
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: "First " },
+            },
+          };
           abortController.abort();
-          yield { type: "text-delta", text: "Second" };
-          yieldCount++;
-        })(),
-        response: Promise.resolve({ messages: [] }),
+          yield {
+            type: "stream_event",
+            event: {
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: "Second" },
+            },
+          };
+        },
+        close: vi.fn(),
       };
 
       // Act
@@ -537,10 +564,7 @@ describe("handleLocalAgentStream", () => {
         },
       );
 
-      // Assert - only first chunk should be processed (stream breaks on abort)
-      expect(yieldCount).toBe(1);
-
-      // Verify only the first chunk made it into the response
+      // Verify only the first chunk is kept, then the stream is cancelled
       const contentUpdates = dbOperations.updates.filter(
         (u) => u.data.content !== undefined,
       );
@@ -549,6 +573,7 @@ describe("handleLocalAgentStream", () => {
         .content as string;
       expect(finalContent).toContain("First ");
       expect(finalContent).not.toContain("Second");
+      expect(finalContent).toContain("[Response cancelled by user]");
     });
 
     it("should save partial response with cancellation note when aborted", async () => {
@@ -559,14 +584,25 @@ describe("handleLocalAgentStream", () => {
 
       const abortController = new AbortController();
 
-      mockStreamResult = {
-        fullStream: (async function* () {
-          yield { type: "text-delta", text: "Partial response" };
+      mockQueryResult = {
+        [Symbol.asyncIterator]: async function* () {
+          yield {
+            type: "stream_event",
+            event: {
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: "Partial response" },
+            },
+          };
           abortController.abort();
-          // This will not be processed due to abort
-          throw new Error("Simulated abort error");
-        })(),
-        response: Promise.resolve({ messages: [] }),
+          yield {
+            type: "stream_event",
+            event: {
+              type: "content_block_delta",
+              delta: { type: "text_delta", text: "Should be ignored" },
+            },
+          };
+        },
+        close: vi.fn(),
       };
 
       // Act
@@ -598,8 +634,19 @@ describe("handleLocalAgentStream", () => {
       const { event } = createFakeEvent();
       mockSettings = buildTestSettings({ enableDyadPro: true });
       mockChatData = buildTestChat();
-      mockStreamResult = createFakeStream([
-        { type: "text-delta", text: "Done" },
+      mockQueryResult = createFakeQueryStream([
+        {
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            delta: { type: "text_delta", text: "Done" },
+          },
+        },
+        {
+          type: "result",
+          subtype: "success",
+          usage: { inputTokens: 10, outputTokens: 5 },
+        },
       ]);
 
       // Act
@@ -627,8 +674,19 @@ describe("handleLocalAgentStream", () => {
       const { event } = createFakeEvent();
       mockSettings = buildTestSettings({ enableDyadPro: true });
       mockChatData = buildTestChat();
-      mockStreamResult = createFakeStream([
-        { type: "text-delta", text: "Done" },
+      mockQueryResult = createFakeQueryStream([
+        {
+          type: "stream_event",
+          event: {
+            type: "content_block_delta",
+            delta: { type: "text_delta", text: "Done" },
+          },
+        },
+        {
+          type: "result",
+          subtype: "success",
+          usage: { inputTokens: 10, outputTokens: 5 },
+        },
       ]);
 
       // Act

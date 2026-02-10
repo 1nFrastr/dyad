@@ -1,104 +1,154 @@
 /**
  * Local Agent v2 Handler
- * Main orchestrator for tool-based agent mode with parallel execution
+ * Main orchestrator backed by Claude Agent SDK runtime.
  */
 
 import { IpcMainInvokeEvent } from "electron";
-import {
-  streamText,
-  ToolSet,
-  stepCountIs,
-  hasToolCall,
-  ModelMessage,
-  type ToolExecutionOptions,
-} from "ai";
+import type { ModelMessage } from "ai";
+import { query } from "@anthropic-ai/claude-agent-sdk";
 import log from "electron-log";
+import { createRequire } from "node:module";
+import path from "node:path";
+import { existsSync } from "node:fs";
 
 import { db } from "@/db";
-import { chats, messages } from "@/db/schema";
+import { chats, messages, mcpServers } from "@/db/schema";
 import { eq } from "drizzle-orm";
 
 import { isDyadProEnabled, isBasicAgentMode } from "@/lib/schemas";
 import { readSettings } from "@/main/settings";
 import { getDyadAppPath } from "@/paths/paths";
-import { getModelClient } from "@/ipc/utils/get_model_client";
 import { safeSend } from "@/ipc/utils/safe_sender";
-import { getMaxTokens, getTemperature } from "@/ipc/utils/token_utils";
-import { getProviderOptions, getAiHeaders } from "@/ipc/utils/provider_options";
 
-import {
-  AgentToolName,
-  buildAgentToolSet,
-  requireAgentToolConsent,
-  clearPendingConsentsForChat,
-} from "./tool_definitions";
+import { clearPendingConsentsForChat } from "./tool_definitions";
 import {
   deployAllFunctionsIfNeeded,
   commitAllChanges,
 } from "./processors/file_operations";
-import { mcpManager } from "@/ipc/utils/mcp_manager";
-import { mcpServers } from "@/db/schema";
-import { requireMcpToolConsent } from "@/ipc/utils/mcp_consent";
-import { getAiMessagesJsonIfWithinLimit } from "@/ipc/utils/ai_messages_utils";
 
 import type { ChatStreamParams, ChatResponseEnd } from "@/ipc/types";
 import {
   AgentContext,
-  parsePartialJson,
   escapeXmlAttr,
   escapeXmlContent,
-  UserMessageContentPart,
   FileEditTracker,
 } from "./tools/types";
 import { sendTelemetryEvent } from "@/ipc/utils/telemetry";
-import {
-  prepareStepMessages,
-  type InjectedMessage,
-} from "./prepare_step_utils";
-import { TOOL_DEFINITIONS } from "./tool_definitions";
-import { parseAiMessagesJson } from "@/ipc/utils/ai_messages_utils";
-import { parseMcpToolKey, sanitizeMcpName } from "@/ipc/utils/mcp_tool_utils";
-import { addIntegrationTool } from "./tools/add_integration";
-import { planningQuestionnaireTool } from "./tools/planning_questionnaire";
-import { writePlanTool } from "./tools/write_plan";
-import { exitPlanTool } from "./tools/exit_plan";
+import { requireMcpToolConsent } from "@/ipc/utils/mcp_consent";
 
 const logger = log.scope("local_agent_handler");
+const require = createRequire(import.meta.url);
 
-// ============================================================================
-// Tool Streaming State Management
-// ============================================================================
+const MUTATING_TOOLS = new Set([
+  "Edit",
+  "MultiEdit",
+  "Write",
+  "Bash",
+  "NotebookEdit",
+  "WebFetch",
+  "WebSearch",
+  "MCP",
+]);
 
-/**
- * Track streaming state per tool call ID
- */
-interface ToolStreamingEntry {
-  toolName: string;
-  argsAccumulated: string;
-}
-const toolStreamingEntries = new Map<string, ToolStreamingEntry>();
+const PLAN_MODE_DISALLOWED_TOOLS = ["ExitPlanMode"];
 
-function getOrCreateStreamingEntry(
-  id: string,
-  toolName?: string,
-): ToolStreamingEntry | undefined {
-  let entry = toolStreamingEntries.get(id);
-  if (!entry && toolName) {
-    entry = {
-      toolName,
-      argsAccumulated: "",
-    };
-    toolStreamingEntries.set(id, entry);
+function resolveClaudeCodeExecutablePath(): string {
+  const envPath = process.env.DYAD_CLAUDE_CODE_EXECUTABLE;
+  if (envPath && existsSync(envPath)) {
+    return envPath;
   }
-  return entry;
+
+  try {
+    const resolved = require.resolve("@anthropic-ai/claude-agent-sdk/cli.js");
+    if (existsSync(resolved)) {
+      return resolved;
+    }
+  } catch {
+    // Continue with fallbacks.
+  }
+
+  const fallback = path.join(
+    process.cwd(),
+    "node_modules",
+    "@anthropic-ai",
+    "claude-agent-sdk",
+    "cli.js",
+  );
+  if (existsSync(fallback)) {
+    return fallback;
+  }
+
+  throw new Error(
+    "Claude Code executable not found. Set DYAD_CLAUDE_CODE_EXECUTABLE or install @anthropic-ai/claude-agent-sdk.",
+  );
 }
 
-function cleanupStreamingEntry(id: string): void {
-  toolStreamingEntries.delete(id);
+function serializeMaybeJson(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
 }
 
-function findToolDefinition(toolName: string) {
-  return TOOL_DEFINITIONS.find((t) => t.name === toolName);
+function buildConversationPromptFromDbMessages(
+  history: Array<{ role: "user" | "assistant"; content: string }>,
+): string {
+  const usable = history.filter((m) => m.content?.trim().length > 0);
+  if (usable.length === 0) {
+    return "";
+  }
+  const transcript = usable
+    .map((m) => `${m.role === "user" ? "User" : "Assistant"}:\n${m.content}`)
+    .join("\n\n");
+  return [
+    "Continue this existing conversation and respond to the latest user request.",
+    "",
+    transcript,
+  ].join("\n");
+}
+
+function buildConversationPromptFromModelMessages(
+  messageOverride: ModelMessage[],
+): string {
+  const transcript = messageOverride
+    .map((m) => {
+      if (!m.content) {
+        return "";
+      }
+      if (typeof m.content === "string") {
+        return `${m.role}:\n${m.content}`;
+      }
+      const text = m.content
+        .map((part: any) => {
+          if (!part || typeof part !== "object") {
+            return "";
+          }
+          if (part.type === "text") {
+            return part.text ?? "";
+          }
+          if (part.type === "tool-call") {
+            return `<tool-call ${part.toolName ?? "unknown"}>${serializeMaybeJson(part.input)}</tool-call>`;
+          }
+          if (part.type === "tool-result") {
+            return `<tool-result ${part.toolName ?? "unknown"}>${serializeMaybeJson(part.output)}</tool-result>`;
+          }
+          return "";
+        })
+        .filter(Boolean)
+        .join("\n");
+      return `${m.role}:\n${text}`;
+    })
+    .filter(Boolean)
+    .join("\n\n");
+  return [
+    "Continue this existing conversation and respond to the latest user request.",
+    "",
+    transcript,
+  ].join("\n");
 }
 
 /**
@@ -174,21 +224,13 @@ export async function handleLocalAgentStream(
   });
 
   let fullResponse = "";
-  let streamingPreview = ""; // Temporary preview for current tool, not persisted
-
-  // Track pending user messages to inject after tool results
-  const pendingUserMessages: UserMessageContentPart[][] = [];
-  // Store injected messages with their insertion index to re-inject at the same spot each step
-  const allInjectedMessages: InjectedMessage[] = [];
 
   try {
-    // Get model client
-    const { modelClient } = await getModelClient(
-      settings.selectedModel,
-      settings,
-    );
+    const enabledMcpServers = await db
+      .select()
+      .from(mcpServers)
+      .where(eq(mcpServers.enabled, true as any));
 
-    // Build tool execute context
     const fileEditTracker: FileEditTracker = Object.create(null);
     const ctx: AgentContext = {
       event,
@@ -204,37 +246,20 @@ export async function handleLocalAgentStream(
       fileEditTracker,
       isDyadPro: isDyadProEnabled(settings),
       onXmlStream: (accumulatedXml: string) => {
-        // Stream accumulated XML to UI without persisting
-        streamingPreview = accumulatedXml;
         sendResponseChunk(
           event,
           req.chatId,
           chat,
-          fullResponse + streamingPreview,
+          fullResponse + accumulatedXml,
         );
       },
       onXmlComplete: (finalXml: string) => {
-        // Write final XML to DB and UI
         fullResponse += finalXml + "\n";
-        streamingPreview = ""; // Clear preview
         updateResponseInDb(placeholderMessageId, fullResponse);
         sendResponseChunk(event, req.chatId, chat, fullResponse);
       },
-      requireConsent: async (params: {
-        toolName: string;
-        toolDescription?: string | null;
-        inputPreview?: string | null;
-      }) => {
-        return requireAgentToolConsent(event, {
-          chatId: chat.id,
-          toolName: params.toolName as AgentToolName,
-          toolDescription: params.toolDescription,
-          inputPreview: params.inputPreview,
-        });
-      },
-      appendUserMessage: (content: UserMessageContentPart[]) => {
-        pendingUserMessages.push(content);
-      },
+      requireConsent: async () => true,
+      appendUserMessage: () => {},
       onUpdateTodos: (todos) => {
         safeSend(event.sender, "agent-tool:todos-update", {
           chatId: chat.id,
@@ -243,224 +268,239 @@ export async function handleLocalAgentStream(
       },
     };
 
-    // Build tool set (agent tools + MCP tools)
-    // In read-only mode, only include read-only tools and skip MCP tools
-    // (since we can't determine if MCP tools modify state)
-    // In plan mode, only include planning tools (read + questionnaire/plan tools)
-    const agentTools = buildAgentToolSet(ctx, { readOnly, planModeOnly });
-    const mcpTools =
-      readOnly || planModeOnly ? {} : await getMcpTools(event, ctx);
-    const allTools: ToolSet = { ...agentTools, ...mcpTools };
+    const appendChunk = async (chunk: string) => {
+      if (!chunk) {
+        return;
+      }
+      fullResponse += chunk;
+      await updateResponseInDb(placeholderMessageId, fullResponse);
+      sendResponseChunk(event, req.chatId, chat, fullResponse);
+    };
 
-    // Prepare message history with graceful fallback
-    // Use messageOverride if provided (e.g., for summarization)
-    const messageHistory: ModelMessage[] = messageOverride
-      ? messageOverride
-      : chat.messages
-          .filter((msg) => msg.content || msg.aiMessagesJson)
-          .flatMap((msg) => parseAiMessagesJson(msg));
-
-    // Stream the response
-    const streamResult = streamText({
-      model: modelClient.model,
-      headers: getAiHeaders({
-        builtinProviderId: modelClient.builtinProviderId,
-      }),
-      providerOptions: getProviderOptions({
-        dyadAppId: chat.app.id,
-        dyadRequestId,
-        dyadDisableFiles: true, // Local agent uses tools, not file injection
-        files: [],
-        mentionedAppsCodebases: [],
-        builtinProviderId: modelClient.builtinProviderId,
-        settings,
-      }),
-      maxOutputTokens: await getMaxTokens(settings.selectedModel),
-      temperature: await getTemperature(settings.selectedModel),
-      maxRetries: 2,
-      system: systemPrompt,
-      messages: messageHistory,
-      tools: allTools,
-      stopWhen: [
-        stepCountIs(25),
-        hasToolCall(addIntegrationTool.name),
-        // In plan mode, stop immediately after presenting a questionnaire,
-        // writing a plan, or exiting plan mode so the agent yields control
-        // back to the user. Without this, some models (e.g. Gemini Pro 3)
-        // ignore the prompt-level "STOP" instruction and keep calling tools
-        // in a loop.
-        ...(planModeOnly
-          ? [
-              hasToolCall(planningQuestionnaireTool.name),
-              hasToolCall(writePlanTool.name),
-              hasToolCall(exitPlanTool.name),
-            ]
-          : []),
-      ],
-      abortSignal: abortController.signal,
-      // Inject pending user messages (e.g., images from web_crawl) between steps
-      // We must re-inject all accumulated messages each step because the AI SDK
-      // doesn't persist dynamically injected messages in its internal state.
-      // We track the insertion index so messages appear at the same position each step.
-      prepareStep: (options) =>
-        prepareStepMessages(options, pendingUserMessages, allInjectedMessages),
-      onFinish: async (response) => {
-        const totalTokens = response.usage?.totalTokens;
-        const inputTokens = response.usage?.inputTokens;
-        const cachedInputTokens = response.usage?.cachedInputTokens;
-        logger.log(
-          "Total tokens used:",
-          totalTokens,
-          "Input tokens:",
-          inputTokens,
-          "Cached input tokens:",
-          cachedInputTokens,
-          "Cache hit ratio:",
-          cachedInputTokens ? (cachedInputTokens ?? 0) / (inputTokens ?? 0) : 0,
+    const conversationPrompt = messageOverride
+      ? buildConversationPromptFromModelMessages(messageOverride)
+      : buildConversationPromptFromDbMessages(
+          chat.messages.map((m) => ({ role: m.role, content: m.content })),
         );
-        if (typeof totalTokens === "number") {
-          await db
-            .update(messages)
-            .set({ maxTokensUsed: totalTokens })
-            .where(eq(messages.id, placeholderMessageId))
-            .catch((err) => logger.error("Failed to save token count", err));
+
+    const readOnlyDisallowed = Array.from(MUTATING_TOOLS);
+    const disallowedTools = [
+      ...(readOnly ? readOnlyDisallowed : []),
+      ...(planModeOnly ? PLAN_MODE_DISALLOWED_TOOLS : []),
+    ];
+
+    let inThinkingBlock = false;
+    let hasStreamedText = false;
+    let wasAborted = false;
+    let latestResult:
+      | {
+          subtype: string;
+          usage?: { inputTokens?: number; outputTokens?: number };
+          result?: string;
+          errors?: string[];
         }
-      },
-      onError: (error: any) => {
-        const errorMessage = error?.error?.message || JSON.stringify(error);
-        logger.error("Local agent stream error:", errorMessage);
-        safeSend(event.sender, "chat:response:error", {
-          chatId: req.chatId,
-          error: `AI error: ${errorMessage}`,
-        });
+      | undefined;
+
+    const stream = query({
+      prompt: conversationPrompt || req.prompt,
+      options: {
+        cwd: appPath,
+        pathToClaudeCodeExecutable: resolveClaudeCodeExecutablePath(),
+        abortController,
+        model: settings.selectedModel.name,
+        maxTurns: 25,
+        permissionMode: planModeOnly ? "plan" : "acceptEdits",
+        tools: { type: "preset", preset: "claude_code" },
+        disallowedTools:
+          disallowedTools.length > 0 ? disallowedTools : undefined,
+        includePartialMessages: true,
+        settingSources: ["user", "project", "local"],
+        systemPrompt: {
+          type: "preset",
+          preset: "claude_code",
+          append: systemPrompt,
+        },
+        canUseTool: async (toolName, input, options) => {
+          const isMcpTool = toolName.startsWith("mcp__");
+          if (!isMcpTool) {
+            return { behavior: "allow", toolUseID: options.toolUseID };
+          }
+
+          const normalized = toolName.replace(/^mcp__/, "");
+          const splitIndex = normalized.indexOf("__");
+          const serverName =
+            splitIndex >= 0 ? normalized.slice(0, splitIndex) : normalized;
+          const mcpToolName =
+            splitIndex >= 0 ? normalized.slice(splitIndex + 2) : normalized;
+
+          const inputPreview = serializeMaybeJson(input).slice(0, 500);
+          const matchingServer = enabledMcpServers.find(
+            (s) =>
+              (s.name || "").toLowerCase().replace(/\W+/g, "_") === serverName,
+          );
+          const ok = matchingServer
+            ? await requireMcpToolConsent(event, {
+                serverId: matchingServer.id,
+                serverName: matchingServer.name,
+                toolName: mcpToolName,
+                toolDescription: "",
+                inputPreview,
+              })
+            : true;
+
+          if (!ok) {
+            return {
+              behavior: "deny",
+              message: `User denied MCP tool ${toolName}`,
+              toolUseID: options.toolUseID,
+            };
+          }
+
+          return {
+            behavior: "allow",
+            toolUseID: options.toolUseID,
+          };
+        },
+        hooks: {
+          PreToolUse: [
+            {
+              hooks: [
+                async (input: any) => {
+                  const toolName = input?.tool_name ?? "unknown";
+                  const toolInput = serializeMaybeJson(input?.tool_input);
+                  await appendChunk(
+                    `<dyad-mcp-tool-call server="local" tool="${escapeXmlAttr(toolName)}">\n${escapeXmlContent(toolInput)}\n</dyad-mcp-tool-call>\n`,
+                  );
+                  return { continue: true };
+                },
+              ],
+            },
+          ],
+          PostToolUse: [
+            {
+              hooks: [
+                async (input: any) => {
+                  const toolName = input?.tool_name ?? "unknown";
+                  const toolOutput = serializeMaybeJson(input?.tool_response);
+                  await appendChunk(
+                    `<dyad-mcp-tool-result server="local" tool="${escapeXmlAttr(toolName)}">\n${escapeXmlContent(toolOutput)}\n</dyad-mcp-tool-result>\n`,
+                  );
+                  return { continue: true };
+                },
+              ],
+            },
+          ],
+          PostToolUseFailure: [
+            {
+              hooks: [
+                async (input: any) => {
+                  const toolName = input?.tool_name ?? "unknown";
+                  const errorMessage = String(input?.error ?? "Tool failed");
+                  await appendChunk(
+                    `<dyad-output type="error" message="Tool '${escapeXmlAttr(toolName)}' failed: ${escapeXmlAttr(errorMessage)}">${escapeXmlContent(errorMessage)}</dyad-output>\n`,
+                  );
+                  return { continue: true };
+                },
+              ],
+            },
+          ],
+        },
       },
     });
 
-    // Process the stream
-    let inThinkingBlock = false;
-
-    for await (const part of streamResult.fullStream) {
+    for await (const part of stream) {
       if (abortController.signal.aborted) {
         logger.log(`Stream aborted for chat ${req.chatId}`);
-        // Clean up pending consent requests to prevent stale UI banners
         clearPendingConsentsForChat(req.chatId);
+        wasAborted = true;
+        stream.close();
         break;
       }
 
-      let chunk = "";
-
-      // Handle thinking block transitions
-      if (
-        inThinkingBlock &&
-        !["reasoning-delta", "reasoning-end", "reasoning-start"].includes(
-          part.type,
-        )
-      ) {
-        chunk = "</think>\n";
-        inThinkingBlock = false;
-      }
-
-      switch (part.type) {
-        case "text-delta":
-          chunk += part.text;
-          break;
-
-        case "reasoning-start":
-          if (!inThinkingBlock) {
-            chunk = "<think>";
-            inThinkingBlock = true;
-          }
-          break;
-
-        case "reasoning-delta":
-          if (!inThinkingBlock) {
-            chunk = "<think>";
-            inThinkingBlock = true;
-          }
-          chunk += part.text;
-          break;
-
-        case "reasoning-end":
+      if (part.type === "stream_event") {
+        const eventPart: any = part.event;
+        if (
+          eventPart?.type === "content_block_delta" &&
+          eventPart?.delta?.type === "text_delta"
+        ) {
           if (inThinkingBlock) {
-            chunk = "</think>\n";
             inThinkingBlock = false;
+            await appendChunk("</think>\n");
           }
-          break;
-
-        case "tool-input-start": {
-          // Initialize streaming state for this tool call
-          getOrCreateStreamingEntry(part.id, part.toolName);
-          break;
-        }
-
-        case "tool-input-delta": {
-          // Accumulate args and stream XML preview
-          const entry = getOrCreateStreamingEntry(part.id);
-          if (entry) {
-            entry.argsAccumulated += part.delta;
-            const toolDef = findToolDefinition(entry.toolName);
-            if (toolDef?.buildXml) {
-              const argsPartial = parsePartialJson(entry.argsAccumulated);
-              const xml = toolDef.buildXml(argsPartial, false);
-              if (xml) {
-                ctx.onXmlStream(xml);
-              }
-            }
+          hasStreamedText = true;
+          await appendChunk(eventPart.delta.text ?? "");
+        } else if (
+          eventPart?.type === "content_block_delta" &&
+          eventPart?.delta?.type === "thinking_delta"
+        ) {
+          if (!inThinkingBlock) {
+            inThinkingBlock = true;
+            await appendChunk("<think>");
           }
-          break;
+          await appendChunk(eventPart.delta.thinking ?? "");
+        } else if (
+          eventPart?.type === "content_block_stop" &&
+          inThinkingBlock
+        ) {
+          inThinkingBlock = false;
+          await appendChunk("</think>\n");
         }
-
-        case "tool-input-end": {
-          // Build final XML and persist
-          const entry = getOrCreateStreamingEntry(part.id);
-          if (entry) {
-            const toolDef = findToolDefinition(entry.toolName);
-            if (toolDef?.buildXml) {
-              const argsPartial = parsePartialJson(entry.argsAccumulated);
-              const xml = toolDef.buildXml(argsPartial, true);
-              if (xml) {
-                ctx.onXmlComplete(xml);
-              }
-            }
-          }
-          cleanupStreamingEntry(part.id);
-          break;
-        }
-
-        case "tool-call":
-          // Tool execution happens via execute callbacks
-          break;
-
-        case "tool-result":
-          // Tool results are already handled by the execute callback
-          break;
+        continue;
       }
 
-      if (chunk) {
-        fullResponse += chunk;
-        await updateResponseInDb(placeholderMessageId, fullResponse);
-        sendResponseChunk(event, req.chatId, chat, fullResponse);
+      if (part.type === "assistant" && !hasStreamedText) {
+        const contentParts: any[] = (part as any).message?.content ?? [];
+        for (const content of contentParts) {
+          if (content?.type === "text" && typeof content.text === "string") {
+            await appendChunk(content.text);
+          } else if (
+            content?.type === "thinking" &&
+            typeof content.thinking === "string"
+          ) {
+            await appendChunk(`<think>${content.thinking}</think>\n`);
+          }
+        }
+        continue;
+      }
+
+      if (part.type === "result") {
+        latestResult = {
+          subtype: (part as any).subtype,
+          usage: (part as any).usage,
+          result: (part as any).result,
+          errors: (part as any).errors,
+        };
       }
     }
 
-    // Close thinking block if still open
     if (inThinkingBlock) {
-      fullResponse += "</think>\n";
-      await updateResponseInDb(placeholderMessageId, fullResponse);
+      await appendChunk("</think>\n");
     }
 
-    // Save the AI SDK messages for multi-turn tool call preservation
-    try {
-      const response = await streamResult.response;
-      const aiMessagesJson = getAiMessagesJsonIfWithinLimit(response.messages);
-      if (aiMessagesJson) {
-        await db
-          .update(messages)
-          .set({ aiMessagesJson })
-          .where(eq(messages.id, placeholderMessageId));
-      }
-    } catch (err) {
-      logger.warn("Failed to save AI messages JSON:", err);
+    if (wasAborted) {
+      throw new Error("Stream aborted");
+    }
+
+    if (!hasStreamedText && latestResult?.result) {
+      await appendChunk(latestResult.result);
+    }
+
+    const totalTokens =
+      (latestResult?.usage?.inputTokens ?? 0) +
+      (latestResult?.usage?.outputTokens ?? 0);
+    if (totalTokens > 0) {
+      await db
+        .update(messages)
+        .set({ maxTokensUsed: totalTokens })
+        .where(eq(messages.id, placeholderMessageId))
+        .catch((err) => logger.error("Failed to save token count", err));
+    }
+
+    if (latestResult?.subtype && latestResult.subtype !== "success") {
+      throw new Error(
+        latestResult.errors?.join("\n") ||
+          `Claude agent runtime failed with subtype: ${latestResult.subtype}`,
+      );
     }
 
     // In read-only and plan mode, skip deploys and commits
@@ -554,82 +594,4 @@ function sendResponseChunk(
     chatId,
     messages: currentMessages,
   });
-}
-
-async function getMcpTools(
-  event: IpcMainInvokeEvent,
-  ctx: AgentContext,
-): Promise<ToolSet> {
-  const mcpToolSet: ToolSet = {};
-
-  try {
-    const servers = await db
-      .select()
-      .from(mcpServers)
-      .where(eq(mcpServers.enabled, true as any));
-
-    for (const s of servers) {
-      const client = await mcpManager.getClient(s.id);
-      const toolSet = await client.tools();
-
-      for (const [name, mcpTool] of Object.entries(toolSet)) {
-        const key = `${sanitizeMcpName(s.name || "")}__${sanitizeMcpName(name)}`;
-
-        mcpToolSet[key] = {
-          description: mcpTool.description,
-          inputSchema: mcpTool.inputSchema,
-          execute: async (args: unknown, execCtx: ToolExecutionOptions) => {
-            try {
-              const inputPreview =
-                typeof args === "string"
-                  ? args
-                  : Array.isArray(args)
-                    ? args.join(" ")
-                    : JSON.stringify(args).slice(0, 500);
-
-              const ok = await requireMcpToolConsent(event, {
-                serverId: s.id,
-                serverName: s.name,
-                toolName: name,
-                toolDescription: mcpTool.description,
-                inputPreview,
-              });
-
-              if (!ok) throw new Error(`User declined running tool ${key}`);
-
-              // Emit XML for UI (MCP tools don't stream, so use onXmlComplete directly)
-              const { serverName, toolName } = parseMcpToolKey(key);
-              const content = JSON.stringify(args, null, 2);
-              ctx.onXmlComplete(
-                `<dyad-mcp-tool-call server="${serverName}" tool="${toolName}">\n${content}\n</dyad-mcp-tool-call>`,
-              );
-
-              const res = await mcpTool.execute(args, execCtx);
-              const resultStr =
-                typeof res === "string" ? res : JSON.stringify(res);
-
-              ctx.onXmlComplete(
-                `<dyad-mcp-tool-result server="${serverName}" tool="${toolName}">\n${resultStr}\n</dyad-mcp-tool-result>`,
-              );
-
-              return resultStr;
-            } catch (error) {
-              const errorMessage =
-                error instanceof Error ? error.message : String(error);
-              const errorStack =
-                error instanceof Error && error.stack ? error.stack : "";
-              ctx.onXmlComplete(
-                `<dyad-output type="error" message="MCP tool '${key}' failed: ${escapeXmlAttr(errorMessage)}">${escapeXmlContent(errorStack || errorMessage)}</dyad-output>`,
-              );
-              throw error;
-            }
-          },
-        };
-      }
-    }
-  } catch (e) {
-    logger.warn("Failed building MCP toolset for local-agent", e);
-  }
-
-  return mcpToolSet;
 }
