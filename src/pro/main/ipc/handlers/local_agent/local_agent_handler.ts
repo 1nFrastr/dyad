@@ -94,6 +94,35 @@ function serializeMaybeJson(value: unknown): string {
   }
 }
 
+/**
+ * Normalize MCP tool input so the Claude Code runtime always receives a plain
+ * object. The runtime/MCP layer can receive input as string, null, or
+ * non-plain object, which leads to "invalid parameters" errors.
+ */
+function normalizeMcpToolInput(input: Record<string, unknown> | unknown): Record<string, unknown> {
+  if (input == null) {
+    return {};
+  }
+  if (typeof input === "string") {
+    const trimmed = input.trim();
+    if (trimmed === "") return {};
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (parsed != null && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Non-JSON string: pass as single key; many MCP tools accept "input" or "query"
+      return { input };
+    }
+    return {};
+  }
+  if (typeof input === "object" && !Array.isArray(input)) {
+    return { ...(input as Record<string, unknown>) };
+  }
+  return {};
+}
+
 function truncateText(value: string, max = 1500): string {
   if (value.length <= max) {
     return value;
@@ -426,6 +455,10 @@ RUNTIME RULES:
             return { behavior: "allow", toolUseID: options.toolUseID };
           }
 
+          // Normalize MCP tool input so the runtime always gets a plain object.
+          // The runtime can receive string/empty/wrong shape and MCP then reports "invalid parameters".
+          const normalizedInput = normalizeMcpToolInput(input);
+
           const normalized = toolName.replace(/^mcp__/, "");
           const splitIndex = normalized.indexOf("__");
           const serverName =
@@ -433,7 +466,7 @@ RUNTIME RULES:
           const mcpToolName =
             splitIndex >= 0 ? normalized.slice(splitIndex + 2) : normalized;
 
-          const inputPreview = serializeMaybeJson(input).slice(0, 500);
+          const inputPreview = serializeMaybeJson(normalizedInput).slice(0, 500);
           const matchingServer = enabledMcpServers.find(
             (s) =>
               (s.name || "").toLowerCase().replace(/\W+/g, "_") === serverName,
@@ -459,6 +492,7 @@ RUNTIME RULES:
           return {
             behavior: "allow",
             toolUseID: options.toolUseID,
+            updatedInput: normalizedInput,
           };
         },
         hooks: {
