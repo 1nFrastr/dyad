@@ -234,8 +234,32 @@ function createAcpStreamWithLogging(
   } as Stream;
 }
 
-function normalizeToolInput(input: unknown): Record<string, unknown> {
+function normalizeToolInput(
+  input: unknown,
+  title?: string,
+): Record<string, unknown> {
   if (input == null) {
+    // Try to extract input from title for Codex format
+    if (title) {
+      const parts = title.split(/\s+/);
+      if (parts.length > 1) {
+        const toolName = parts[0];
+        const args = parts.slice(1).join(" ");
+
+        // Common patterns
+        if (
+          toolName === "Read" ||
+          toolName === "Write" ||
+          toolName === "Edit"
+        ) {
+          return { path: args, file_path: args };
+        }
+        if (toolName === "Run") {
+          return { command: args };
+        }
+        return { args };
+      }
+    }
     return {};
   }
   if (typeof input === "string") {
@@ -254,7 +278,90 @@ function normalizeToolInput(input: unknown): Record<string, unknown> {
     return {};
   }
   if (typeof input === "object" && !Array.isArray(input)) {
-    return { ...(input as Record<string, unknown>) };
+    const inputObj = input as Record<string, unknown>;
+
+    // Check if this is Codex format (has parsed_cmd or command but no file_path/path)
+    const isCodexFormat =
+      (inputObj.parsed_cmd != null || inputObj.command != null) &&
+      inputObj.file_path == null &&
+      inputObj.path == null &&
+      inputObj.target_file == null;
+
+    // If Codex format and we have title, extract from title instead
+    if (isCodexFormat && title) {
+      const parts = title.split(/\s+/);
+      if (parts.length > 1) {
+        const toolName = parts[0];
+        const args = parts.slice(1).join(" ");
+
+        // Common patterns
+        if (
+          toolName === "Read" ||
+          toolName === "Write" ||
+          toolName === "Edit"
+        ) {
+          return { path: args, file_path: args };
+        }
+        if (toolName === "Run") {
+          // Check for "cat > file <<'EOF'" pattern (Codex file write pattern)
+          const catWriteMatch = args.match(
+            /cat\s+>\s+([^\s<]+)\s+<<['"]EOF['"]/,
+          );
+          if (catWriteMatch) {
+            const filePath = catWriteMatch[1];
+            // Try to extract content from command if available
+            let commandStr = "";
+            if (typeof inputObj.command === "string") {
+              commandStr = inputObj.command;
+            } else if (Array.isArray(inputObj.command)) {
+              // Codex format: ["/bin/zsh", "-lc", "cat > file <<'EOF'\ncontent\nEOF"]
+              // The actual command is usually in the last element or joined
+              commandStr =
+                inputObj.command.length > 2
+                  ? inputObj.command[2] // Usually the third element contains the full command
+                  : inputObj.command.join(" ");
+            }
+
+            // Extract content between <<'EOF' and EOF (handle both 'EOF and "EOF)
+            const contentMatch = commandStr.match(/<<['"]EOF['"]([\s\S]*?)EOF/);
+            const content = contentMatch ? contentMatch[1].trim() : "";
+
+            return {
+              path: filePath,
+              file_path: filePath,
+              content: content,
+            };
+          }
+          // Regular Run command
+          return { command: args };
+        }
+        return { args };
+      }
+    }
+
+    // Check for Codex Edit format (has changes object)
+    if (inputObj.changes != null && typeof inputObj.changes === "object") {
+      const changes = inputObj.changes as Record<string, unknown>;
+      // Get first file change
+      const filePath = Object.keys(changes)[0];
+      if (filePath) {
+        const change = changes[filePath] as Record<string, unknown> | undefined;
+        if (change?.new_content != null) {
+          const newContent =
+            typeof change.new_content === "string" ? change.new_content : "";
+          return {
+            path: filePath,
+            file_path: filePath,
+            new_string: newContent,
+            // Codex Edit doesn't provide old_string, so we'll use empty string
+            old_string: "",
+          };
+        }
+      }
+    }
+
+    // For Claude Code format (has file_path/path) or other formats, return as-is
+    return { ...inputObj };
   }
   return {};
 }
@@ -303,6 +410,17 @@ function buildPrettyToolCallXml(
       return `<dyad-write path="${escapeXmlAttr(filePath)}" description="Write file with Claude Code ACP runtime">${escapeXmlContent(truncateText(content))}</dyad-write>\n`;
     }
     case "Edit": {
+      // If old_string is empty or missing, treat as Write (Codex Edit format)
+      const oldString = input.old_string;
+      const newString = input.new_string;
+      if (
+        (!oldString || (typeof oldString === "string" && oldString.trim() === "")) &&
+        newString
+      ) {
+        const content = typeof newString === "string" ? newString : "";
+        return `<dyad-write path="${escapeXmlAttr(filePath)}" description="Write file with Codex ACP runtime">${escapeXmlContent(truncateText(content))}</dyad-write>\n`;
+      }
+      // Regular Edit with old_string and new_string
       const content = serializeMaybeJson({
         old_string: input.old_string,
         new_string: input.new_string,
@@ -332,6 +450,16 @@ function buildPrettyToolCallXml(
     case "Glob":
     case "LS":
       return `<dyad-list-files directory="${escapeXmlAttr(filePath || ".")}" recursive="true" state="finished"></dyad-list-files>\n`;
+    case "Run": {
+      // Check if this is a file write operation (Codex uses "Run cat > file")
+      if (filePath && input.content != null) {
+        const content = typeof input.content === "string" ? input.content : "";
+        return `<dyad-write path="${escapeXmlAttr(filePath)}" description="Write file with Codex ACP runtime">${escapeXmlContent(truncateText(content))}</dyad-write>\n`;
+      }
+      // Regular Run command
+      const command = typeof input.command === "string" ? input.command : "";
+      return `<dyad-mcp-tool-call server="local" tool="Run">\n${escapeXmlContent(truncateText(command))}\n</dyad-mcp-tool-call>\n`;
+    }
     default: {
       const toolInput = serializeMaybeJson(input);
       return `<dyad-mcp-tool-call server="local" tool="${escapeXmlAttr(normalizedToolName)}">\n${escapeXmlContent(truncateText(toolInput))}\n</dyad-mcp-tool-call>\n`;
@@ -421,10 +549,15 @@ function parseToolNameFromUpdate(update: ToolCall | ToolCallUpdate): string {
     return update.title;
   }
 
-  // Fallback to title
-  return typeof update.title === "string" && update.title.length > 0
-    ? update.title
-    : "unknown";
+  // Fallback to title, but extract just the tool name (Codex includes args in title)
+  if (typeof update.title === "string" && update.title.length > 0) {
+    // Codex format: "Read Index.tsx" or "Run npm install"
+    // Extract first word as tool name
+    const firstWord = update.title.split(/\s+/)[0];
+    return firstWord || update.title;
+  }
+
+  return "unknown";
 }
 
 function findAllowOption(params: RequestPermissionRequest): string | undefined {
@@ -680,12 +813,15 @@ export async function handleLocalAgentStream(
 
         case "tool_call": {
           const toolName = parseToolNameFromUpdate(update);
-          const input = normalizeToolInput(update.rawInput);
+          const input = normalizeToolInput(
+            update.rawInput,
+            update.title || undefined,
+          );
           const signature = JSON.stringify({ toolName, input });
 
           // Debug log for tool call structure (helps diagnose format differences)
           logger.debug(
-            `[tool_call] runtime=${acpRuntime} toolName=${toolName} title=${update.title} _meta=${JSON.stringify((update as any)?._meta || {})}`,
+            `[tool_call] runtime=${acpRuntime} toolName=${toolName} title=${update.title} input=${JSON.stringify(input)} _meta=${JSON.stringify((update as any)?._meta || {})}`,
           );
 
           if (hasMeaningfulToolInput(input)) {
@@ -697,7 +833,10 @@ export async function handleLocalAgentStream(
 
         case "tool_call_update": {
           const toolName = parseToolNameFromUpdate(update);
-          const input = normalizeToolInput(update.rawInput);
+          const input = normalizeToolInput(
+            update.rawInput,
+            update.title || undefined,
+          );
           const signature = JSON.stringify({ toolName, input });
           const previousSignature = toolCallInputSignatures.get(
             update.toolCallId,
@@ -708,7 +847,7 @@ export async function handleLocalAgentStream(
 
           // Debug log for tool call update
           logger.debug(
-            `[tool_call_update] toolName=${toolName} status=${update.status} shouldEmit=${shouldEmit}`,
+            `[tool_call_update] toolName=${toolName} status=${update.status} shouldEmit=${shouldEmit} input=${JSON.stringify(input)}`,
           );
 
           if (shouldEmit) {
