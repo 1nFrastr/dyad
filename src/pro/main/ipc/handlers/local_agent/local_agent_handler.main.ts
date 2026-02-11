@@ -62,6 +62,7 @@ import { addIntegrationTool } from "./tools/add_integration";
 import { planningQuestionnaireTool } from "./tools/planning_questionnaire";
 import { writePlanTool } from "./tools/write_plan";
 import { exitPlanTool } from "./tools/exit_plan";
+import { isLocalAgentMcpDisabled } from "./local_agent_mcp";
 
 const logger = log.scope("local_agent_handler");
 
@@ -137,6 +138,7 @@ export async function handleLocalAgentStream(
   },
 ): Promise<boolean> {
   const settings = readSettings();
+  const disableMcp = isLocalAgentMcpDisabled(settings);
 
   // Check Pro status or Basic Agent mode
   // Basic Agent mode allows non-Pro users with quota (quota check is done in chat_stream_handlers)
@@ -249,7 +251,9 @@ export async function handleLocalAgentStream(
     // In plan mode, only include planning tools (read + questionnaire/plan tools)
     const agentTools = buildAgentToolSet(ctx, { readOnly, planModeOnly });
     const mcpTools =
-      readOnly || planModeOnly ? {} : await getMcpTools(event, ctx);
+      readOnly || planModeOnly || disableMcp
+        ? {}
+        : await getMcpTools(event, ctx);
     const allTools: ToolSet = { ...agentTools, ...mcpTools };
 
     // Prepare message history with graceful fallback

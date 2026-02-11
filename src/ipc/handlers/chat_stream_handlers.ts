@@ -59,7 +59,13 @@ import { MAX_CHAT_TURNS_IN_CONTEXT } from "@/constants/settings_constants";
 import { validateChatContext } from "../utils/context_paths_utils";
 import { getProviderOptions, getAiHeaders } from "../utils/provider_options";
 
-import { handleLocalAgentStream } from "../../pro/main/ipc/handlers/local_agent/local_agent_handler";
+import { handleLocalAgentStream as handleLocalAgentStreamClaudeAgentSdk } from "../../pro/main/ipc/handlers/local_agent/local_agent_handler";
+import { handleLocalAgentStream as handleLocalAgentStreamVercelAi } from "../../pro/main/ipc/handlers/local_agent/local_agent_handler.main";
+import { handleLocalAgentStream as handleLocalAgentStreamAcp } from "../../pro/main/ipc/handlers/local_agent/local_agent_handler.acp";
+import {
+  getLocalAgentRuntime,
+  type LocalAgentRuntime,
+} from "../../pro/main/ipc/handlers/local_agent/local_agent_runtime";
 
 import { safeSend } from "../utils/safe_sender";
 import { cleanFullResponse } from "../utils/cleanFullResponse";
@@ -151,6 +157,42 @@ function parseMcpToolKey(toolKey: string): {
 // Ensure the temp directory exists
 if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
+
+async function handleLocalAgentStreamByRuntime(
+  runtime: LocalAgentRuntime,
+  event: any,
+  req: ChatStreamParams,
+  abortController: AbortController,
+  options: {
+    placeholderMessageId: number;
+    systemPrompt: string;
+    dyadRequestId: string;
+    readOnly?: boolean;
+    planModeOnly?: boolean;
+    skipProCheck?: boolean;
+    messageOverride?: ModelMessage[];
+  },
+) {
+  switch (runtime) {
+    case "vercel-ai":
+      return handleLocalAgentStreamVercelAi(
+        event,
+        req,
+        abortController,
+        options,
+      );
+    case "acp":
+      return handleLocalAgentStreamAcp(event, req, abortController, options);
+    case "claude-agent-sdk":
+    default:
+      return handleLocalAgentStreamClaudeAgentSdk(
+        event,
+        req,
+        abortController,
+        options,
+      );
+  }
 }
 
 // Helper function to process stream chunks
@@ -565,6 +607,7 @@ ${componentSnippet}
           mentionedAppNames,
           updatedChat.app.id, // Exclude current app
         );
+        const localAgentRuntime = getLocalAgentRuntime(settings);
         const willUseLocalAgentStream =
           settings.selectedChatMode === "build" ||
           settings.selectedChatMode === "local-agent" ||
@@ -572,7 +615,7 @@ ${componentSnippet}
           settings.selectedChatMode === "plan" ||
           settings.selectedChatMode === "agent";
         logger.log(
-          `chat mode routing: mode=${settings.selectedChatMode}, localAgentRuntime=${willUseLocalAgentStream}`,
+          `chat mode routing: mode=${settings.selectedChatMode}, useLocalAgentRuntime=${willUseLocalAgentStream}, runtime=${localAgentRuntime}`,
         );
 
         const isDeepContextEnabled =
@@ -1089,7 +1132,8 @@ IMPORTANT RUNTIME INSTRUCTION:
 - Do NOT output <dyad-write>, <dyad-edit>, <dyad-search-replace>, <dyad-delete>, or any other dyad XML tags as the primary way to make changes.
 - Make all code/file changes by directly using Claude Code tools (Read/Edit/Write/MultiEdit/Bash as needed).
 - After edits, briefly summarize what you changed.`;
-          const streamSuccess = await handleLocalAgentStream(
+          const streamSuccess = await handleLocalAgentStreamByRuntime(
+            localAgentRuntime,
             event,
             req,
             abortController,
@@ -1102,7 +1146,9 @@ IMPORTANT RUNTIME INSTRUCTION:
             },
           );
           if (!streamSuccess) {
-            logger.warn("Build mode local runtime did not complete successfully");
+            logger.warn(
+              "Build mode local runtime did not complete successfully",
+            );
           }
           return;
         }
@@ -1123,7 +1169,8 @@ IMPORTANT RUNTIME INSTRUCTION:
           // Return value indicates success/failure for quota tracking.
           // Ask mode doesn't consume quota, but we still capture it for
           // consistent error handling.
-          const streamSuccess = await handleLocalAgentStream(
+          const streamSuccess = await handleLocalAgentStreamByRuntime(
+            localAgentRuntime,
             event,
             req,
             abortController,
@@ -1160,13 +1207,19 @@ IMPORTANT RUNTIME INSTRUCTION:
             themePrompt,
           });
 
-          await handleLocalAgentStream(event, req, abortController, {
-            placeholderMessageId: placeholderAssistantMessage.id,
-            systemPrompt: planModeSystemPrompt,
-            dyadRequestId: dyadRequestId ?? "[no-request-id]",
-            planModeOnly: true,
-            messageOverride: chatMessages,
-          });
+          await handleLocalAgentStreamByRuntime(
+            localAgentRuntime,
+            event,
+            req,
+            abortController,
+            {
+              placeholderMessageId: placeholderAssistantMessage.id,
+              systemPrompt: planModeSystemPrompt,
+              dyadRequestId: dyadRequestId ?? "[no-request-id]",
+              planModeOnly: true,
+              messageOverride: chatMessages,
+            },
+          );
           return;
         }
 
@@ -1197,7 +1250,8 @@ IMPORTANT RUNTIME INSTRUCTION:
 
           let streamSuccess = false;
           try {
-            streamSuccess = await handleLocalAgentStream(
+            streamSuccess = await handleLocalAgentStreamByRuntime(
+              localAgentRuntime,
               event,
               req,
               abortController,
@@ -1220,7 +1274,8 @@ IMPORTANT RUNTIME INSTRUCTION:
 
         // Handle agent mode via Claude Code runtime as well.
         if (settings.selectedChatMode === "agent") {
-          const streamSuccess = await handleLocalAgentStream(
+          const streamSuccess = await handleLocalAgentStreamByRuntime(
+            localAgentRuntime,
             event,
             req,
             abortController,
@@ -1232,7 +1287,9 @@ IMPORTANT RUNTIME INSTRUCTION:
             },
           );
           if (!streamSuccess) {
-            logger.warn("Agent mode local runtime did not complete successfully");
+            logger.warn(
+              "Agent mode local runtime did not complete successfully",
+            );
           }
           return;
         }

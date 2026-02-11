@@ -35,6 +35,10 @@ import {
 } from "./tools/types";
 import { sendTelemetryEvent } from "@/ipc/utils/telemetry";
 import { requireMcpToolConsent } from "@/ipc/utils/mcp_consent";
+import {
+  isLocalAgentMcpDisabled,
+  MCP_DISCOVERY_TOOLS,
+} from "./local_agent_mcp";
 
 const logger = log.scope("local_agent_handler");
 const require = createRequire(import.meta.url);
@@ -99,7 +103,9 @@ function serializeMaybeJson(value: unknown): string {
  * object. The runtime/MCP layer can receive input as string, null, or
  * non-plain object, which leads to "invalid parameters" errors.
  */
-function normalizeMcpToolInput(input: Record<string, unknown> | unknown): Record<string, unknown> {
+function normalizeMcpToolInput(
+  input: Record<string, unknown> | unknown,
+): Record<string, unknown> {
   if (input == null) {
     return {};
   }
@@ -108,7 +114,11 @@ function normalizeMcpToolInput(input: Record<string, unknown> | unknown): Record
     if (trimmed === "") return {};
     try {
       const parsed = JSON.parse(trimmed) as unknown;
-      if (parsed != null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      if (
+        parsed != null &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed)
+      ) {
         return parsed as Record<string, unknown>;
       }
     } catch {
@@ -295,6 +305,7 @@ export async function handleLocalAgentStream(
   },
 ): Promise<boolean> {
   const settings = readSettings();
+  const disableMcp = isLocalAgentMcpDisabled(settings);
 
   // Check Pro status or Basic Agent mode
   // Basic Agent mode allows non-Pro users with quota (quota check is done in chat_stream_handlers)
@@ -339,10 +350,12 @@ export async function handleLocalAgentStream(
   let fullResponse = "";
 
   try {
-    const enabledMcpServers = await db
-      .select()
-      .from(mcpServers)
-      .where(eq(mcpServers.enabled, true as any));
+    const enabledMcpServers = disableMcp
+      ? []
+      : await db
+          .select()
+          .from(mcpServers)
+          .where(eq(mcpServers.enabled, true as any));
 
     const fileEditTracker: FileEditTracker = Object.create(null);
     const ctx: AgentContext = {
@@ -400,6 +413,7 @@ export async function handleLocalAgentStream(
     const disallowedTools = [
       ...(readOnly ? readOnlyDisallowed : []),
       ...(planModeOnly ? PLAN_MODE_DISALLOWED_TOOLS : []),
+      ...(disableMcp ? [...MCP_DISCOVERY_TOOLS] : []),
     ];
     const claudeExecutablePath = resolveClaudeCodeExecutablePath();
     const runtimeMode = readOnly
@@ -450,6 +464,17 @@ RUNTIME RULES:
 - Only use tags in plain text when the user explicitly asks for tag examples.`,
         },
         canUseTool: async (toolName, input, options) => {
+          if (
+            disableMcp &&
+            (toolName === "MCP" || toolName.startsWith("mcp__"))
+          ) {
+            return {
+              behavior: "deny",
+              message: `MCP is disabled in this Dyad runtime`,
+              toolUseID: options.toolUseID,
+            };
+          }
+
           const isMcpTool = toolName.startsWith("mcp__");
           if (!isMcpTool) {
             return { behavior: "allow", toolUseID: options.toolUseID };
@@ -466,7 +491,10 @@ RUNTIME RULES:
           const mcpToolName =
             splitIndex >= 0 ? normalized.slice(splitIndex + 2) : normalized;
 
-          const inputPreview = serializeMaybeJson(normalizedInput).slice(0, 500);
+          const inputPreview = serializeMaybeJson(normalizedInput).slice(
+            0,
+            500,
+          );
           const matchingServer = enabledMcpServers.find(
             (s) =>
               (s.name || "").toLowerCase().replace(/\W+/g, "_") === serverName,
@@ -513,9 +541,7 @@ RUNTIME RULES:
           ],
           PostToolUse: [
             {
-              hooks: [
-                async () => ({ continue: true }),
-              ],
+              hooks: [async () => ({ continue: true })],
             },
           ],
           PostToolUseFailure: [

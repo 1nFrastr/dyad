@@ -46,6 +46,7 @@
     "build-storybook": "storybook build"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^0.13.1",
     "@ai-sdk/amazon-bedrock": "^4.0.46",
     "@ai-sdk/anthropic": "^3.0.35",
     "@ai-sdk/azure": "^3.0.26",
@@ -76,6 +77,7 @@
     "@vercel/sdk": "^1.18.0",
     "@vitejs/plugin-react": "^4.3.4",
     "@vscode/ripgrep": "^1.17.0",
+    "@zed-industries/claude-code-acp": "^0.16.1",
     "ai": "^6.0.68",
     "better-sqlite3": "^12.6.2",
     "class-variance-authority": "^0.7.1",

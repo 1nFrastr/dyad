@@ -1,5 +1,4 @@
 import { useSettings } from "@/hooks/useSettings";
-import { useFreeAgentQuota } from "@/hooks/useFreeAgentQuota";
 import {
   Select,
   SelectContent,
@@ -8,26 +7,16 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import type { ChatMode } from "@/lib/schemas";
-import { isDyadProEnabled, getEffectiveDefaultChatMode } from "@/lib/schemas";
+import { getEffectiveDefaultChatMode } from "@/lib/schemas";
 
 export function DefaultChatModeSelector() {
   const { settings, updateSettings, envVars } = useSettings();
-  const { isQuotaExceeded, isLoading: isQuotaLoading } = useFreeAgentQuota();
 
   if (!settings) {
     return null;
   }
 
-  const isProEnabled = isDyadProEnabled(settings);
-  // Wait for quota status to load before determining effective default
-  const freeAgentQuotaAvailable = !isQuotaLoading && !isQuotaExceeded;
-  const effectiveDefault = getEffectiveDefaultChatMode(
-    settings,
-    envVars,
-    freeAgentQuotaAvailable,
-  );
-  // Show Basic Agent option if user is Pro OR if they have free quota available
-  const showBasicAgentOption = isProEnabled || freeAgentQuotaAvailable;
+  const effectiveDefault = getEffectiveDefaultChatMode(settings, envVars);
 
   const handleDefaultChatModeChange = (value: ChatMode) => {
     updateSettings({ defaultChatMode: value });
@@ -40,7 +29,7 @@ export function DefaultChatModeSelector() {
       case "agent":
         return "Build (MCP)";
       case "local-agent":
-        return isProEnabled ? "Agent" : "Basic Agent";
+        return "Build";
       case "ask":
       default:
         throw new Error(`Unknown chat mode: ${mode}`);
@@ -64,20 +53,6 @@ export function DefaultChatModeSelector() {
             <SelectValue>{getModeDisplayName(effectiveDefault)}</SelectValue>
           </SelectTrigger>
           <SelectContent>
-            {showBasicAgentOption && (
-              <SelectItem value="local-agent">
-                <div className="flex flex-col items-start">
-                  <span className="font-medium">
-                    {isProEnabled ? "Agent" : "Basic Agent"}
-                  </span>
-                  <span className="text-xs text-muted-foreground">
-                    {isProEnabled
-                      ? "Better at bigger tasks"
-                      : "Free tier (5 messages/day)"}
-                  </span>
-                </div>
-              </SelectItem>
-            )}
             <SelectItem value="build">
               <div className="flex flex-col items-start">
                 <span className="font-medium">Build</span>

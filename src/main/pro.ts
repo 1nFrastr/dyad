@@ -13,8 +13,8 @@ export function handleDyadProReturn({ apiKey }: { apiKey: string }) {
       },
     },
     enableDyadPro: true,
-    // Switch to local-agent mode and auto model for a good default experience
-    selectedChatMode: "local-agent",
+    // Keep Build mode as the default entry chat mode.
+    selectedChatMode: "build",
     selectedModel: {
       name: "auto",
       provider: "auto",

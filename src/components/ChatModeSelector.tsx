@@ -11,7 +11,6 @@ import {
   TooltipContent,
 } from "@/components/ui/tooltip";
 import { useSettings } from "@/hooks/useSettings";
-import { useFreeAgentQuota } from "@/hooks/useFreeAgentQuota";
 import type { ChatMode } from "@/lib/schemas";
 import { isDyadProEnabled } from "@/lib/schemas";
 import { cn } from "@/lib/utils";
@@ -38,9 +37,12 @@ export function ChatModeSelector() {
   const chatId = routerState.location.search.id as number | undefined;
   const currentChatMessages = chatId ? (messagesById.get(chatId) ?? []) : [];
 
-  const selectedMode = settings?.selectedChatMode || "build";
   const isProEnabled = settings ? isDyadProEnabled(settings) : false;
-  const { messagesRemaining, isQuotaExceeded } = useFreeAgentQuota();
+  const selectedModeRaw = settings?.selectedChatMode || "build";
+  const selectedMode: ChatMode =
+    !isProEnabled && selectedModeRaw === "local-agent"
+      ? "build"
+      : selectedModeRaw;
 
   const handleModeChange = (value: string) => {
     const newMode = value as ChatMode;
@@ -83,8 +85,7 @@ export function ChatModeSelector() {
       case "agent":
         return "Build (MCP)";
       case "local-agent":
-        // Show "Basic Agent" for non-Pro users, "Agent" for Pro users
-        return isProEnabled ? "Agent" : "Basic Agent";
+        return "Agent";
       case "plan":
         return "Plan";
       default:
@@ -147,24 +148,6 @@ export function ChatModeSelector() {
               </div>
             </SelectItem>
           </>
-        )}
-        {!isProEnabled && (
-          <SelectItem value="local-agent" disabled={isQuotaExceeded}>
-            <div className="flex flex-col items-start">
-              <div className="flex items-center gap-1.5">
-                <span className="font-medium">Basic Agent</span>
-                <span className="text-xs text-muted-foreground">
-                  ({isQuotaExceeded ? "0" : messagesRemaining}/5 remaining for
-                  today)
-                </span>
-              </div>
-              <span className="text-xs text-muted-foreground">
-                {isQuotaExceeded
-                  ? "Daily limit reached"
-                  : "Try our AI agent for free"}
-              </span>
-            </div>
-          </SelectItem>
         )}
         <SelectItem value="build">
           <div className="flex flex-col items-start">

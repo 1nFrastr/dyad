@@ -141,9 +141,9 @@ export function ProviderSettingsPage({ provider }: ProviderSettingsPageProps) {
       };
       if (isDyad) {
         settingsUpdate.enableDyadPro = true;
-        // Set default chat mode to local-agent when user upgrades to pro
+        // Keep Build as the default mode when user upgrades to pro.
         if (isNewDyadProSetup) {
-          settingsUpdate.defaultChatMode = "local-agent";
+          settingsUpdate.defaultChatMode = "build";
         }
       }
       await updateSettings(settingsUpdate);
