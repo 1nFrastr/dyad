@@ -12,6 +12,7 @@ import {
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type SessionNotification,
+  type Stream,
   type ToolCall,
   type ToolCallUpdate,
 } from "@agentclientprotocol/sdk";
@@ -19,7 +20,6 @@ import log from "electron-log";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { existsSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 
@@ -115,6 +115,81 @@ function truncateText(value: string, max = 1500): string {
     return value;
   }
   return `${value.slice(0, max)}\n... [truncated]`;
+}
+
+function formatAcpMessageSummary(
+  msg: { method?: string; id?: string | number | null; params?: unknown; result?: unknown; error?: { code?: number; message?: string } },
+  direction: "→" | "←",
+): string {
+  const method = msg.method ?? "?";
+  const id = msg.id != null ? ` id=${msg.id}` : "";
+  let extra = "";
+  if ("result" in msg && msg.result !== undefined) {
+    const r = msg.result as Record<string, unknown>;
+    extra = Object.keys(r ?? {}).slice(0, 3).join(",");
+    if (extra) extra = ` result=${extra}`;
+  } else if ("error" in msg && msg.error) {
+    extra = ` error=${String(msg.error.message ?? msg.error.code ?? "?")}`;
+  } else if (msg.params && typeof msg.params === "object") {
+    const p = msg.params as Record<string, unknown>;
+    const keys = Object.keys(p).filter((k) => !k.startsWith("_"));
+    extra = keys.length ? ` params=${keys.join(",")}` : "";
+    // Extract tool name for session/update with tool_call or tool_call_update
+    if (method === "session/update" && typeof p.update === "object" && p.update) {
+      const u = p.update as Record<string, unknown>;
+      const sessionUpdate = u.sessionUpdate;
+      if (sessionUpdate === "tool_call" || sessionUpdate === "tool_call_update") {
+        const meta = u._meta as Record<string, unknown> | undefined;
+        const metaToolName = meta?.claudeCode as
+          | Record<string, unknown>
+          | undefined;
+        const toolName =
+          (typeof metaToolName?.toolName === "string" &&
+            metaToolName.toolName) ||
+          (typeof u.title === "string" && u.title) ||
+          "unknown";
+        extra += ` tool=${toolName}`;
+        if (sessionUpdate === "tool_call_update" && u.status) {
+          extra += ` status=${u.status}`;
+        }
+      }
+    }
+  }
+  return `[acp] ${direction} ${method}${id}${extra}`;
+}
+
+function createAcpStreamWithLogging(
+  output: WritableStream<Uint8Array>,
+  input: ReadableStream<Uint8Array>,
+): Stream {
+  const { readable: baseReadable, writable: baseWritable } = ndJsonStream(
+    output,
+    input,
+  );
+
+  const loggingReadable = baseReadable.pipeThrough(
+    new TransformStream({
+      transform(msg, controller) {
+        logger.debug(formatAcpMessageSummary(msg, "←"));
+        controller.enqueue(msg);
+      },
+    }),
+  );
+
+  const logWritableTransform = new TransformStream({
+    transform(msg, controller) {
+      logger.debug(formatAcpMessageSummary(msg, "→"));
+      controller.enqueue(msg);
+    },
+  });
+  logWritableTransform.readable.pipeTo(baseWritable).catch((err) => {
+    logger.error("[acp] writable pipe error", err);
+  });
+
+  return {
+    readable: loggingReadable,
+    writable: logWritableTransform.writable,
+  } as Stream;
 }
 
 function normalizeToolInput(input: unknown): Record<string, unknown> {
@@ -494,7 +569,7 @@ export async function handleLocalAgentStream(
     }
   });
 
-  const stream = ndJsonStream(
+  const stream = createAcpStreamWithLogging(
     Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
     Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
   );
@@ -594,21 +669,6 @@ export async function handleLocalAgentStream(
       };
     },
 
-    async readTextFile(params) {
-      let content = await readFile(params.path, "utf8");
-      if (params.line !== undefined || params.limit !== undefined) {
-        const lines = content.split("\n");
-        const start = params.line ? Math.max(0, params.line - 1) : 0;
-        const end = params.limit ? start + params.limit : lines.length;
-        content = lines.slice(start, end).join("\n");
-      }
-      return { content };
-    },
-
-    async writeTextFile(params) {
-      await writeFile(params.path, params.content, "utf8");
-      return {};
-    },
   };
 
   const connection = new ClientSideConnection(() => client, stream);
@@ -639,12 +699,6 @@ export async function handleLocalAgentStream(
 
     const initResponse = await connection.initialize({
       protocolVersion: 1,
-      clientCapabilities: {
-        fs: {
-          readTextFile: true,
-          writeTextFile: true,
-        },
-      },
       clientInfo: {
         name: "dyad",
         title: "Dyad",
