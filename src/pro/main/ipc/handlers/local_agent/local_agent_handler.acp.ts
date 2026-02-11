@@ -9,7 +9,6 @@ import {
   ClientSideConnection,
   ndJsonStream,
   type Client,
-  type McpServer,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type SessionNotification,
@@ -25,7 +24,7 @@ import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 
 import { db } from "@/db";
-import { chats, messages, mcpServers } from "@/db/schema";
+import { chats, messages } from "@/db/schema";
 import { eq } from "drizzle-orm";
 
 import { isDyadProEnabled, isBasicAgentMode } from "@/lib/schemas";
@@ -47,12 +46,7 @@ import {
   FileEditTracker,
 } from "./tools/types";
 import { sendTelemetryEvent } from "@/ipc/utils/telemetry";
-import { requireMcpToolConsent } from "@/ipc/utils/mcp_consent";
 import { buildAcpSessionMeta } from "./local_agent_handler_acp_meta";
-import {
-  isLocalAgentMcpDisabled,
-  MCP_DISCOVERY_TOOLS,
-} from "./local_agent_mcp";
 
 const logger = log.scope("local_agent_handler_acp");
 const require = createRequire(import.meta.url);
@@ -286,48 +280,6 @@ function buildConversationPromptFromModelMessages(
   ].join("\n");
 }
 
-function sanitizeName(input: string): string {
-  return input.toLowerCase().replace(/\W+/g, "_");
-}
-
-function toAcpMcpServers(
-  servers: (typeof mcpServers.$inferSelect)[],
-): McpServer[] {
-  const result: McpServer[] = [];
-  for (const server of servers) {
-    if (server.transport === "stdio") {
-      if (!server.command) {
-        continue;
-      }
-      result.push({
-        name: server.name,
-        command: server.command,
-        args: server.args ?? [],
-        env: Object.entries(server.envJson ?? {}).map(([name, value]) => ({
-          name,
-          value,
-        })),
-      });
-      continue;
-    }
-
-    if (server.transport === "http" && server.url) {
-      result.push({
-        type: "http",
-        name: server.name,
-        url: server.url,
-        headers: Object.entries(server.headersJson ?? {}).map(
-          ([name, value]) => ({
-            name,
-            value,
-          }),
-        ),
-      });
-    }
-  }
-  return result;
-}
-
 function parseToolNameFromUpdate(update: ToolCall | ToolCallUpdate): string {
   const metaToolName = (update as any)?._meta?.claudeCode?.toolName;
   if (typeof metaToolName === "string" && metaToolName.length > 0) {
@@ -343,36 +295,10 @@ function parseToolNameFromUpdate(update: ToolCall | ToolCallUpdate): string {
     : "unknown";
 }
 
-function parseMcpTool(
-  toolName: string,
-): { serverName: string; toolName: string } | null {
-  if (!toolName.startsWith("mcp__")) {
-    return null;
-  }
-  const normalized = toolName.slice("mcp__".length);
-  const splitIndex = normalized.indexOf("__");
-  if (splitIndex < 0) {
-    return null;
-  }
-  return {
-    serverName: normalized.slice(0, splitIndex),
-    toolName: normalized.slice(splitIndex + 2),
-  };
-}
-
 function findAllowOption(params: RequestPermissionRequest): string | undefined {
   return (
     params.options.find((option) => option.kind === "allow_once")?.optionId ??
     params.options.find((option) => option.kind === "allow_always")?.optionId
-  );
-}
-
-function findRejectOption(
-  params: RequestPermissionRequest,
-): string | undefined {
-  return (
-    params.options.find((option) => option.kind === "reject_once")?.optionId ??
-    params.options.find((option) => option.kind === "reject_always")?.optionId
   );
 }
 
@@ -426,7 +352,6 @@ export async function handleLocalAgentStream(
   },
 ): Promise<boolean> {
   const settings = readSettings();
-  const disableMcp = isLocalAgentMcpDisabled(settings);
 
   if (
     !skipProCheck &&
@@ -468,13 +393,6 @@ export async function handleLocalAgentStream(
   let promptStopReason = "end_turn";
   let streamAborted = false;
 
-  const enabledMcpServers = disableMcp
-    ? []
-    : await db
-        .select()
-        .from(mcpServers)
-        .where(eq(mcpServers.enabled, true as any));
-
   const runtimeMode = readOnly
     ? "ask"
     : planModeOnly
@@ -492,7 +410,6 @@ export async function handleLocalAgentStream(
   const disallowedTools = [
     ...(readOnly ? Array.from(MUTATING_TOOLS) : []),
     ...(planModeOnly ? PLAN_MODE_DISALLOWED_TOOLS : []),
-    ...(disableMcp ? [...MCP_DISCOVERY_TOOLS] : []),
   ];
 
   const conversationPrompt = messageOverride
@@ -663,83 +580,18 @@ export async function handleLocalAgentStream(
         return { outcome: { outcome: "cancelled" } };
       }
 
-      const rawToolName = parseToolNameFromUpdate(params.toolCall);
-      const mcpInfo = parseMcpTool(rawToolName);
-      if (disableMcp && mcpInfo) {
-        const rejectOption = findRejectOption(params);
-        return rejectOption
-          ? {
-              outcome: {
-                outcome: "selected",
-                optionId: rejectOption,
-              },
-            }
-          : { outcome: { outcome: "cancelled" } };
+      // ACP runtime policy: auto-allow tool calls (including MCP).
+      // Do not route MCP permissions through Dyad's per-server consent flow.
+      const allowOption = findAllowOption(params);
+      if (!allowOption) {
+        return { outcome: { outcome: "cancelled" } };
       }
-
-      if (!mcpInfo) {
-        const allowOption = findAllowOption(params);
-        if (!allowOption) {
-          return { outcome: { outcome: "cancelled" } };
-        }
-        return {
-          outcome: {
-            outcome: "selected",
-            optionId: allowOption,
-          },
-        };
-      }
-
-      const matchingServer = enabledMcpServers.find(
-        (server) => sanitizeName(server.name || "") === mcpInfo.serverName,
-      );
-
-      if (!matchingServer) {
-        const allowOption = findAllowOption(params);
-        return allowOption
-          ? {
-              outcome: {
-                outcome: "selected",
-                optionId: allowOption,
-              },
-            }
-          : { outcome: { outcome: "cancelled" } };
-      }
-
-      const inputPreview = serializeMaybeJson(params.toolCall.rawInput).slice(
-        0,
-        500,
-      );
-
-      const ok = await requireMcpToolConsent(event, {
-        serverId: matchingServer.id,
-        serverName: matchingServer.name,
-        toolName: mcpInfo.toolName,
-        toolDescription: params.toolCall.title ?? "",
-        inputPreview,
-      });
-
-      if (ok) {
-        const allowOption = findAllowOption(params);
-        return allowOption
-          ? {
-              outcome: {
-                outcome: "selected",
-                optionId: allowOption,
-              },
-            }
-          : { outcome: { outcome: "cancelled" } };
-      }
-
-      const rejectOption = findRejectOption(params);
-      return rejectOption
-        ? {
-            outcome: {
-              outcome: "selected",
-              optionId: rejectOption,
-            },
-          }
-        : { outcome: { outcome: "cancelled" } };
+      return {
+        outcome: {
+          outcome: "selected",
+          optionId: allowOption,
+        },
+      };
     },
 
     async readTextFile(params) {
@@ -806,7 +658,9 @@ export async function handleLocalAgentStream(
 
     const sessionResponse = await connection.newSession({
       cwd: appPath,
-      mcpServers: disableMcp ? [] : toAcpMcpServers(enabledMcpServers),
+      // Do not inject Dyad-managed MCP servers for ACP runtime.
+      // Claude Code ACP uses runtime-side MCP configuration.
+      mcpServers: [],
       _meta: buildAcpSessionMeta({
         systemPrompt,
         selectedModelName: settings.selectedModel.name,
