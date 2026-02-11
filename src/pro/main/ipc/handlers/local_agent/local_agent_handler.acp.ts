@@ -1,6 +1,6 @@
 /**
  * Local Agent v2 Handler
- * ACP runtime implementation backed by @zed-industries/claude-code-acp.
+ * ACP runtime implementation using pluggable runtime adapters.
  */
 
 import { IpcMainInvokeEvent } from "electron";
@@ -13,13 +13,8 @@ import {
   type RequestPermissionResponse,
   type SessionNotification,
   type Stream,
-  type ToolCall,
-  type ToolCallUpdate,
 } from "@agentclientprotocol/sdk";
 import log from "electron-log";
-import { createRequire } from "node:module";
-import path from "node:path";
-import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 
@@ -46,11 +41,9 @@ import {
   FileEditTracker,
 } from "./tools/types";
 import { sendTelemetryEvent } from "@/ipc/utils/telemetry";
-import { buildAcpSessionMeta } from "./local_agent_handler_acp_meta";
-import { getAcpRuntime, type AcpRuntime } from "./local_agent_runtime";
+import { getAcpAdapter } from "./acp";
 
 const logger = log.scope("local_agent_handler_acp");
-const require = createRequire(import.meta.url);
 
 const MUTATING_TOOLS = new Set([
   "Edit",
@@ -66,65 +59,6 @@ const MUTATING_TOOLS = new Set([
 const PLAN_MODE_DISALLOWED_TOOLS = ["ExitPlanMode"];
 
 type PermissionMode = "default" | "acceptEdits" | "plan" | "dontAsk";
-
-interface AcpRuntimeConfig {
-  packageName: string;
-  entryPath: string;
-  displayName: string;
-  apiKeyEnvName: string;
-}
-
-const ACP_RUNTIME_CONFIGS: Record<AcpRuntime, AcpRuntimeConfig> = {
-  "claude-code": {
-    packageName: "@zed-industries/claude-code-acp",
-    entryPath: "dist/index.js",
-    displayName: "Claude Code",
-    apiKeyEnvName: "ANTHROPIC_API_KEY",
-  },
-  codex: {
-    packageName: "@zed-industries/codex-acp",
-    entryPath: "bin/codex-acp.js",
-    displayName: "Codex",
-    apiKeyEnvName: "OPENAI_API_KEY",
-  },
-};
-
-function resolveAcpAgentEntrypoint(runtime: AcpRuntime): string {
-  const config = ACP_RUNTIME_CONFIGS[runtime];
-
-  // 1. Check environment variable override
-  const envPath = process.env.DYAD_ACP_AGENT_ENTRY;
-  if (envPath && existsSync(envPath)) {
-    return envPath;
-  }
-
-  // 2. Try require.resolve
-  try {
-    const resolved = require.resolve(
-      `${config.packageName}/${config.entryPath}`,
-    );
-    if (existsSync(resolved)) {
-      return resolved;
-    }
-  } catch {
-    // Continue with fallback.
-  }
-
-  // 3. Fallback to node_modules path
-  const fallback = path.join(
-    process.cwd(),
-    "node_modules",
-    ...config.packageName.split("/"),
-    config.entryPath,
-  );
-  if (existsSync(fallback)) {
-    return fallback;
-  }
-
-  throw new Error(
-    `${config.displayName} ACP adapter not found. Install ${config.packageName} or set DYAD_ACP_AGENT_ENTRY.`,
-  );
-}
 
 function serializeMaybeJson(value: unknown): string {
   if (typeof value === "string") {
@@ -234,138 +168,6 @@ function createAcpStreamWithLogging(
   } as Stream;
 }
 
-function normalizeToolInput(
-  input: unknown,
-  title?: string,
-): Record<string, unknown> {
-  if (input == null) {
-    // Try to extract input from title for Codex format
-    if (title) {
-      const parts = title.split(/\s+/);
-      if (parts.length > 1) {
-        const toolName = parts[0];
-        const args = parts.slice(1).join(" ");
-
-        // Common patterns
-        if (
-          toolName === "Read" ||
-          toolName === "Write" ||
-          toolName === "Edit"
-        ) {
-          return { path: args, file_path: args };
-        }
-        if (toolName === "Run") {
-          return { command: args };
-        }
-        return { args };
-      }
-    }
-    return {};
-  }
-  if (typeof input === "string") {
-    const trimmed = input.trim();
-    if (!trimmed) {
-      return {};
-    }
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return parsed as Record<string, unknown>;
-      }
-    } catch {
-      return { input };
-    }
-    return {};
-  }
-  if (typeof input === "object" && !Array.isArray(input)) {
-    const inputObj = input as Record<string, unknown>;
-
-    // Check if this is Codex format (has parsed_cmd or command but no file_path/path)
-    const isCodexFormat =
-      (inputObj.parsed_cmd != null || inputObj.command != null) &&
-      inputObj.file_path == null &&
-      inputObj.path == null &&
-      inputObj.target_file == null;
-
-    // If Codex format and we have title, extract from title instead
-    if (isCodexFormat && title) {
-      const parts = title.split(/\s+/);
-      if (parts.length > 1) {
-        const toolName = parts[0];
-        const args = parts.slice(1).join(" ");
-
-        // Common patterns
-        if (
-          toolName === "Read" ||
-          toolName === "Write" ||
-          toolName === "Edit"
-        ) {
-          return { path: args, file_path: args };
-        }
-        if (toolName === "Run") {
-          // Check for "cat > file <<'EOF'" pattern (Codex file write pattern)
-          const catWriteMatch = args.match(
-            /cat\s+>\s+([^\s<]+)\s+<<['"]EOF['"]/,
-          );
-          if (catWriteMatch) {
-            const filePath = catWriteMatch[1];
-            // Try to extract content from command if available
-            let commandStr = "";
-            if (typeof inputObj.command === "string") {
-              commandStr = inputObj.command;
-            } else if (Array.isArray(inputObj.command)) {
-              // Codex format: ["/bin/zsh", "-lc", "cat > file <<'EOF'\ncontent\nEOF"]
-              // The actual command is usually in the last element or joined
-              commandStr =
-                inputObj.command.length > 2
-                  ? inputObj.command[2] // Usually the third element contains the full command
-                  : inputObj.command.join(" ");
-            }
-
-            // Extract content between <<'EOF' and EOF (handle both 'EOF and "EOF)
-            const contentMatch = commandStr.match(/<<['"]EOF['"]([\s\S]*?)EOF/);
-            const content = contentMatch ? contentMatch[1].trim() : "";
-
-            return {
-              path: filePath,
-              file_path: filePath,
-              content: content,
-            };
-          }
-          // Regular Run command
-          return { command: args };
-        }
-        return { args };
-      }
-    }
-
-    // Check for Codex Edit format (has changes object)
-    if (inputObj.changes != null && typeof inputObj.changes === "object") {
-      const changes = inputObj.changes as Record<string, unknown>;
-      // Get first file change
-      const filePath = Object.keys(changes)[0];
-      if (filePath) {
-        const change = changes[filePath] as Record<string, unknown> | undefined;
-        if (change?.new_content != null) {
-          const newContent =
-            typeof change.new_content === "string" ? change.new_content : "";
-          return {
-            path: filePath,
-            file_path: filePath,
-            new_string: newContent,
-            // Codex Edit doesn't provide old_string, so we'll use empty string
-            old_string: "",
-          };
-        }
-      }
-    }
-
-    // For Claude Code format (has file_path/path) or other formats, return as-is
-    return { ...inputObj };
-  }
-  return {};
-}
-
 function hasMeaningfulToolInput(input: Record<string, unknown>): boolean {
   if (Object.keys(input).length === 0) {
     return false;
@@ -397,6 +199,7 @@ function getInputPath(input: Record<string, unknown>): string {
 function buildPrettyToolCallXml(
   toolName: string,
   input: Record<string, unknown>,
+  runtimeDisplayName: string,
 ): string {
   const normalizedToolName = toolName.startsWith("mcp__acp__")
     ? toolName.slice("mcp__acp__".length)
@@ -407,18 +210,19 @@ function buildPrettyToolCallXml(
       return `<dyad-read path="${escapeXmlAttr(filePath)}"></dyad-read>\n`;
     case "Write": {
       const content = typeof input.content === "string" ? input.content : "";
-      return `<dyad-write path="${escapeXmlAttr(filePath)}" description="Write file with Claude Code ACP runtime">${escapeXmlContent(truncateText(content))}</dyad-write>\n`;
+      return `<dyad-write path="${escapeXmlAttr(filePath)}" description="Write file with ${runtimeDisplayName} ACP runtime">${escapeXmlContent(truncateText(content))}</dyad-write>\n`;
     }
     case "Edit": {
-      // If old_string is empty or missing, treat as Write (Codex Edit format)
+      // If old_string is empty or missing, treat as Write (some runtimes don't provide old_string)
       const oldString = input.old_string;
       const newString = input.new_string;
       if (
-        (!oldString || (typeof oldString === "string" && oldString.trim() === "")) &&
+        (!oldString ||
+          (typeof oldString === "string" && oldString.trim() === "")) &&
         newString
       ) {
         const content = typeof newString === "string" ? newString : "";
-        return `<dyad-write path="${escapeXmlAttr(filePath)}" description="Write file with Codex ACP runtime">${escapeXmlContent(truncateText(content))}</dyad-write>\n`;
+        return `<dyad-write path="${escapeXmlAttr(filePath)}" description="Write file with ${runtimeDisplayName} ACP runtime">${escapeXmlContent(truncateText(content))}</dyad-write>\n`;
       }
       // Regular Edit with old_string and new_string
       const content = serializeMaybeJson({
@@ -426,11 +230,11 @@ function buildPrettyToolCallXml(
         new_string: input.new_string,
         replace_all: input.replace_all,
       });
-      return `<dyad-edit path="${escapeXmlAttr(filePath)}" description="Edit file with Claude Code ACP runtime">${escapeXmlContent(truncateText(content))}</dyad-edit>\n`;
+      return `<dyad-edit path="${escapeXmlAttr(filePath)}" description="Edit file with ${runtimeDisplayName} ACP runtime">${escapeXmlContent(truncateText(content))}</dyad-edit>\n`;
     }
     case "MultiEdit": {
       const content = serializeMaybeJson({ edits: input.edits });
-      return `<dyad-edit path="${escapeXmlAttr(filePath)}" description="Multi-edit file with Claude Code ACP runtime">${escapeXmlContent(truncateText(content))}</dyad-edit>\n`;
+      return `<dyad-edit path="${escapeXmlAttr(filePath)}" description="Multi-edit file with ${runtimeDisplayName} ACP runtime">${escapeXmlContent(truncateText(content))}</dyad-edit>\n`;
     }
     case "Grep": {
       const query =
@@ -451,10 +255,10 @@ function buildPrettyToolCallXml(
     case "LS":
       return `<dyad-list-files directory="${escapeXmlAttr(filePath || ".")}" recursive="true" state="finished"></dyad-list-files>\n`;
     case "Run": {
-      // Check if this is a file write operation (Codex uses "Run cat > file")
+      // Check if this is a file write operation (some runtimes use "Run cat > file")
       if (filePath && input.content != null) {
         const content = typeof input.content === "string" ? input.content : "";
-        return `<dyad-write path="${escapeXmlAttr(filePath)}" description="Write file with Codex ACP runtime">${escapeXmlContent(truncateText(content))}</dyad-write>\n`;
+        return `<dyad-write path="${escapeXmlAttr(filePath)}" description="Write file with ${runtimeDisplayName} ACP runtime">${escapeXmlContent(truncateText(content))}</dyad-write>\n`;
       }
       // Regular Run command
       const command = typeof input.command === "string" ? input.command : "";
@@ -523,41 +327,6 @@ function buildConversationPromptFromModelMessages(
     "",
     transcript,
   ].join("\n");
-}
-
-function parseToolNameFromUpdate(update: ToolCall | ToolCallUpdate): string {
-  // Try Claude Code metadata first
-  const claudeCodeToolName = (update as any)?._meta?.claudeCode?.toolName;
-  if (typeof claudeCodeToolName === "string" && claudeCodeToolName.length > 0) {
-    return claudeCodeToolName;
-  }
-
-  // Try Codex metadata (might use different structure)
-  const codexToolName = (update as any)?._meta?.codex?.toolName;
-  if (typeof codexToolName === "string" && codexToolName.length > 0) {
-    return codexToolName;
-  }
-
-  // Try generic _meta.toolName
-  const metaToolName = (update as any)?._meta?.toolName;
-  if (typeof metaToolName === "string" && metaToolName.length > 0) {
-    return metaToolName;
-  }
-
-  // Handle MCP tools
-  if (typeof update.title === "string" && update.title.startsWith("mcp__")) {
-    return update.title;
-  }
-
-  // Fallback to title, but extract just the tool name (Codex includes args in title)
-  if (typeof update.title === "string" && update.title.length > 0) {
-    // Codex format: "Read Index.tsx" or "Run npm install"
-    // Extract first word as tool name
-    const firstWord = update.title.split(/\s+/)[0];
-    return firstWord || update.title;
-  }
-
-  return "unknown";
 }
 
 function findAllowOption(params: RequestPermissionRequest): string | undefined {
@@ -733,35 +502,14 @@ export async function handleLocalAgentStream(
     return appendChain;
   };
 
-  const acpRuntime = getAcpRuntime(settings);
-  const acpRuntimeConfig = ACP_RUNTIME_CONFIGS[acpRuntime];
-  const acpEntrypoint = resolveAcpAgentEntrypoint(acpRuntime);
+  // Get the appropriate adapter for the current runtime
+  const adapter = getAcpAdapter(settings);
+  const acpEntrypoint = adapter.resolveEntrypoint();
 
-  const spawnEnv: Record<string, string> = {
+  const spawnEnv = {
     ...process.env,
-    ...(process.env.DYAD_CLAUDE_CODE_EXECUTABLE
-      ? { CLAUDE_CODE_EXECUTABLE: process.env.DYAD_CLAUDE_CODE_EXECUTABLE }
-      : {}),
+    ...adapter.getSpawnEnv(settings),
   };
-
-  // Set API key based on runtime type
-  if (acpRuntime === "claude-code") {
-    const anthropicKey = (settings as any)?.providerSettings?.anthropic?.apiKey
-      ?.value;
-    if (anthropicKey && !process.env.ANTHROPIC_API_KEY) {
-      spawnEnv.ANTHROPIC_API_KEY = anthropicKey;
-    }
-  } else if (acpRuntime === "codex") {
-    const openaiKey = (settings as any)?.providerSettings?.openai?.apiKey
-      ?.value;
-    if (openaiKey && !process.env.OPENAI_API_KEY) {
-      spawnEnv.OPENAI_API_KEY = openaiKey;
-    }
-    // Codex also accepts CODEX_API_KEY
-    if (openaiKey && !process.env.CODEX_API_KEY) {
-      spawnEnv.CODEX_API_KEY = openaiKey;
-    }
-  }
 
   const child = spawn(process.execPath, [acpEntrypoint], {
     cwd: appPath,
@@ -812,8 +560,8 @@ export async function handleLocalAgentStream(
         }
 
         case "tool_call": {
-          const toolName = parseToolNameFromUpdate(update);
-          const input = normalizeToolInput(
+          const toolName = adapter.parseToolName(update);
+          const input = adapter.normalizeToolInput(
             update.rawInput,
             update.title || undefined,
           );
@@ -821,19 +569,21 @@ export async function handleLocalAgentStream(
 
           // Debug log for tool call structure (helps diagnose format differences)
           logger.debug(
-            `[tool_call] runtime=${acpRuntime} toolName=${toolName} title=${update.title} input=${JSON.stringify(input)} _meta=${JSON.stringify((update as any)?._meta || {})}`,
+            `[tool_call] runtime=${adapter.id} toolName=${toolName} title=${update.title} input=${JSON.stringify(input)} _meta=${JSON.stringify((update as any)?._meta || {})}`,
           );
 
           if (hasMeaningfulToolInput(input)) {
-            await enqueueAppend(buildPrettyToolCallXml(toolName, input));
+            await enqueueAppend(
+              buildPrettyToolCallXml(toolName, input, adapter.displayName),
+            );
           }
           toolCallInputSignatures.set(update.toolCallId, signature);
           break;
         }
 
         case "tool_call_update": {
-          const toolName = parseToolNameFromUpdate(update);
-          const input = normalizeToolInput(
+          const toolName = adapter.parseToolName(update);
+          const input = adapter.normalizeToolInput(
             update.rawInput,
             update.title || undefined,
           );
@@ -851,7 +601,9 @@ export async function handleLocalAgentStream(
           );
 
           if (shouldEmit) {
-            await enqueueAppend(buildPrettyToolCallXml(toolName, input));
+            await enqueueAppend(
+              buildPrettyToolCallXml(toolName, input, adapter.displayName),
+            );
           }
           toolCallInputSignatures.set(update.toolCallId, signature);
 
@@ -912,7 +664,7 @@ export async function handleLocalAgentStream(
   };
 
   logger.log(
-    `[acp-runtime] start chatId=${req.chatId} mode=${runtimeMode} runtime=${acpRuntimeConfig.displayName} model=${settings.selectedModel.name} cwd=${appPath} adapter=${acpEntrypoint}`,
+    `[acp-runtime] start chatId=${req.chatId} mode=${runtimeMode} runtime=${adapter.displayName} model=${settings.selectedModel.name} cwd=${appPath} adapter=${acpEntrypoint}`,
   );
 
   try {
@@ -936,9 +688,9 @@ export async function handleLocalAgentStream(
     const sessionResponse = await connection.newSession({
       cwd: appPath,
       // Do not inject Dyad-managed MCP servers for ACP runtime.
-      // Claude Code ACP uses runtime-side MCP configuration.
+      // ACP runtimes use runtime-side MCP configuration.
       mcpServers: [],
-      _meta: buildAcpSessionMeta({
+      _meta: adapter.buildSessionMeta({
         systemPrompt,
         selectedModelName: settings.selectedModel.name,
         disallowedTools,
