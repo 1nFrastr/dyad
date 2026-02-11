@@ -78,6 +78,7 @@
     "@vitejs/plugin-react": "^4.3.4",
     "@vscode/ripgrep": "^1.17.0",
     "@zed-industries/claude-code-acp": "^0.16.1",
+    "@zed-industries/codex-acp": "^0.9.2",
     "ai": "^6.0.68",
     "better-sqlite3": "^12.6.2",
     "class-variance-authority": "^0.7.1",

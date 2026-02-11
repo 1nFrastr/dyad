@@ -47,6 +47,7 @@ import {
 } from "./tools/types";
 import { sendTelemetryEvent } from "@/ipc/utils/telemetry";
 import { buildAcpSessionMeta } from "./local_agent_handler_acp_meta";
+import { getAcpRuntime, type AcpRuntime } from "./local_agent_runtime";
 
 const logger = log.scope("local_agent_handler_acp");
 const require = createRequire(import.meta.url);
@@ -66,15 +67,42 @@ const PLAN_MODE_DISALLOWED_TOOLS = ["ExitPlanMode"];
 
 type PermissionMode = "default" | "acceptEdits" | "plan" | "dontAsk";
 
-function resolveAcpAgentEntrypoint(): string {
+interface AcpRuntimeConfig {
+  packageName: string;
+  entryPath: string;
+  displayName: string;
+  apiKeyEnvName: string;
+}
+
+const ACP_RUNTIME_CONFIGS: Record<AcpRuntime, AcpRuntimeConfig> = {
+  "claude-code": {
+    packageName: "@zed-industries/claude-code-acp",
+    entryPath: "dist/index.js",
+    displayName: "Claude Code",
+    apiKeyEnvName: "ANTHROPIC_API_KEY",
+  },
+  codex: {
+    packageName: "@zed-industries/codex-acp",
+    entryPath: "bin/codex-acp.js",
+    displayName: "Codex",
+    apiKeyEnvName: "OPENAI_API_KEY",
+  },
+};
+
+function resolveAcpAgentEntrypoint(runtime: AcpRuntime): string {
+  const config = ACP_RUNTIME_CONFIGS[runtime];
+
+  // 1. Check environment variable override
   const envPath = process.env.DYAD_ACP_AGENT_ENTRY;
   if (envPath && existsSync(envPath)) {
     return envPath;
   }
 
+  // 2. Try require.resolve
   try {
-    const resolved =
-      require.resolve("@zed-industries/claude-code-acp/dist/index.js");
+    const resolved = require.resolve(
+      `${config.packageName}/${config.entryPath}`,
+    );
     if (existsSync(resolved)) {
       return resolved;
     }
@@ -82,20 +110,19 @@ function resolveAcpAgentEntrypoint(): string {
     // Continue with fallback.
   }
 
+  // 3. Fallback to node_modules path
   const fallback = path.join(
     process.cwd(),
     "node_modules",
-    "@zed-industries",
-    "claude-code-acp",
-    "dist",
-    "index.js",
+    ...config.packageName.split("/"),
+    config.entryPath,
   );
   if (existsSync(fallback)) {
     return fallback;
   }
 
   throw new Error(
-    "Claude Code ACP adapter not found. Install @zed-industries/claude-code-acp or set DYAD_ACP_AGENT_ENTRY.",
+    `${config.displayName} ACP adapter not found. Install ${config.packageName} or set DYAD_ACP_AGENT_ENTRY.`,
   );
 }
 
@@ -118,7 +145,13 @@ function truncateText(value: string, max = 1500): string {
 }
 
 function formatAcpMessageSummary(
-  msg: { method?: string; id?: string | number | null; params?: unknown; result?: unknown; error?: { code?: number; message?: string } },
+  msg: {
+    method?: string;
+    id?: string | number | null;
+    params?: unknown;
+    result?: unknown;
+    error?: { code?: number; message?: string };
+  },
   direction: "→" | "←",
 ): string {
   const method = msg.method ?? "?";
@@ -126,7 +159,9 @@ function formatAcpMessageSummary(
   let extra = "";
   if ("result" in msg && msg.result !== undefined) {
     const r = msg.result as Record<string, unknown>;
-    extra = Object.keys(r ?? {}).slice(0, 3).join(",");
+    extra = Object.keys(r ?? {})
+      .slice(0, 3)
+      .join(",");
     if (extra) extra = ` result=${extra}`;
   } else if ("error" in msg && msg.error) {
     extra = ` error=${String(msg.error.message ?? msg.error.code ?? "?")}`;
@@ -135,10 +170,17 @@ function formatAcpMessageSummary(
     const keys = Object.keys(p).filter((k) => !k.startsWith("_"));
     extra = keys.length ? ` params=${keys.join(",")}` : "";
     // Extract tool name for session/update with tool_call or tool_call_update
-    if (method === "session/update" && typeof p.update === "object" && p.update) {
+    if (
+      method === "session/update" &&
+      typeof p.update === "object" &&
+      p.update
+    ) {
       const u = p.update as Record<string, unknown>;
       const sessionUpdate = u.sessionUpdate;
-      if (sessionUpdate === "tool_call" || sessionUpdate === "tool_call_update") {
+      if (
+        sessionUpdate === "tool_call" ||
+        sessionUpdate === "tool_call_update"
+      ) {
         const meta = u._meta as Record<string, unknown> | undefined;
         const metaToolName = meta?.claudeCode as
           | Record<string, unknown>
@@ -356,15 +398,30 @@ function buildConversationPromptFromModelMessages(
 }
 
 function parseToolNameFromUpdate(update: ToolCall | ToolCallUpdate): string {
-  const metaToolName = (update as any)?._meta?.claudeCode?.toolName;
+  // Try Claude Code metadata first
+  const claudeCodeToolName = (update as any)?._meta?.claudeCode?.toolName;
+  if (typeof claudeCodeToolName === "string" && claudeCodeToolName.length > 0) {
+    return claudeCodeToolName;
+  }
+
+  // Try Codex metadata (might use different structure)
+  const codexToolName = (update as any)?._meta?.codex?.toolName;
+  if (typeof codexToolName === "string" && codexToolName.length > 0) {
+    return codexToolName;
+  }
+
+  // Try generic _meta.toolName
+  const metaToolName = (update as any)?._meta?.toolName;
   if (typeof metaToolName === "string" && metaToolName.length > 0) {
     return metaToolName;
   }
 
+  // Handle MCP tools
   if (typeof update.title === "string" && update.title.startsWith("mcp__")) {
     return update.title;
   }
 
+  // Fallback to title
   return typeof update.title === "string" && update.title.length > 0
     ? update.title
     : "unknown";
@@ -543,23 +600,40 @@ export async function handleLocalAgentStream(
     return appendChain;
   };
 
-  const acpEntrypoint = resolveAcpAgentEntrypoint();
+  const acpRuntime = getAcpRuntime(settings);
+  const acpRuntimeConfig = ACP_RUNTIME_CONFIGS[acpRuntime];
+  const acpEntrypoint = resolveAcpAgentEntrypoint(acpRuntime);
+
+  const spawnEnv: Record<string, string> = {
+    ...process.env,
+    ...(process.env.DYAD_CLAUDE_CODE_EXECUTABLE
+      ? { CLAUDE_CODE_EXECUTABLE: process.env.DYAD_CLAUDE_CODE_EXECUTABLE }
+      : {}),
+  };
+
+  // Set API key based on runtime type
+  if (acpRuntime === "claude-code") {
+    const anthropicKey = (settings as any)?.providerSettings?.anthropic?.apiKey
+      ?.value;
+    if (anthropicKey && !process.env.ANTHROPIC_API_KEY) {
+      spawnEnv.ANTHROPIC_API_KEY = anthropicKey;
+    }
+  } else if (acpRuntime === "codex") {
+    const openaiKey = (settings as any)?.providerSettings?.openai?.apiKey
+      ?.value;
+    if (openaiKey && !process.env.OPENAI_API_KEY) {
+      spawnEnv.OPENAI_API_KEY = openaiKey;
+    }
+    // Codex also accepts CODEX_API_KEY
+    if (openaiKey && !process.env.CODEX_API_KEY) {
+      spawnEnv.CODEX_API_KEY = openaiKey;
+    }
+  }
+
   const child = spawn(process.execPath, [acpEntrypoint], {
     cwd: appPath,
     stdio: ["pipe", "pipe", "pipe"],
-    env: {
-      ...process.env,
-      ...(process.env.DYAD_CLAUDE_CODE_EXECUTABLE
-        ? { CLAUDE_CODE_EXECUTABLE: process.env.DYAD_CLAUDE_CODE_EXECUTABLE }
-        : {}),
-      ...((settings as any)?.providerSettings?.anthropic?.apiKey?.value &&
-      !process.env.ANTHROPIC_API_KEY
-        ? {
-            ANTHROPIC_API_KEY: (settings as any).providerSettings.anthropic
-              .apiKey.value,
-          }
-        : {}),
-    },
+    env: spawnEnv,
   });
 
   child.stderr.on("data", (chunk) => {
@@ -608,6 +682,12 @@ export async function handleLocalAgentStream(
           const toolName = parseToolNameFromUpdate(update);
           const input = normalizeToolInput(update.rawInput);
           const signature = JSON.stringify({ toolName, input });
+
+          // Debug log for tool call structure (helps diagnose format differences)
+          logger.debug(
+            `[tool_call] runtime=${acpRuntime} toolName=${toolName} title=${update.title} _meta=${JSON.stringify((update as any)?._meta || {})}`,
+          );
+
           if (hasMeaningfulToolInput(input)) {
             await enqueueAppend(buildPrettyToolCallXml(toolName, input));
           }
@@ -625,6 +705,11 @@ export async function handleLocalAgentStream(
           const shouldEmit =
             hasMeaningfulToolInput(input) &&
             (previousSignature == null || previousSignature !== signature);
+
+          // Debug log for tool call update
+          logger.debug(
+            `[tool_call_update] toolName=${toolName} status=${update.status} shouldEmit=${shouldEmit}`,
+          );
 
           if (shouldEmit) {
             await enqueueAppend(buildPrettyToolCallXml(toolName, input));
@@ -668,7 +753,6 @@ export async function handleLocalAgentStream(
         },
       };
     },
-
   };
 
   const connection = new ClientSideConnection(() => client, stream);
@@ -689,7 +773,7 @@ export async function handleLocalAgentStream(
   };
 
   logger.log(
-    `[acp-runtime] start chatId=${req.chatId} mode=${runtimeMode} model=${settings.selectedModel.name} cwd=${appPath} adapter=${acpEntrypoint}`,
+    `[acp-runtime] start chatId=${req.chatId} mode=${runtimeMode} runtime=${acpRuntimeConfig.displayName} model=${settings.selectedModel.name} cwd=${appPath} adapter=${acpEntrypoint}`,
   );
 
   try {
