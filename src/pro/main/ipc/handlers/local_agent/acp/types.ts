@@ -35,6 +35,21 @@ export interface AcpRuntimeAdapter {
   resolveEntrypoint(): string;
 
   /**
+   * Get the CLI command to execute (for runtimes that use CLI commands instead of Node.js scripts).
+   * If this returns a non-empty string, the handler will use this command with getSpawnArgs()
+   * instead of using Node.js to execute resolveEntrypoint().
+   * @returns The command name (e.g., "opencode") or empty string to use Node.js mode
+   */
+  getSpawnCommand?(): string;
+
+  /**
+   * Get the CLI arguments for the spawn command.
+   * Only used if getSpawnCommand() returns a non-empty string.
+   * @returns Array of command arguments (e.g., ["acp"])
+   */
+  getSpawnArgs?(): string[];
+
+  /**
    * Get environment variables to set when spawning the ACP process.
    * Typically includes API keys based on user settings.
    */

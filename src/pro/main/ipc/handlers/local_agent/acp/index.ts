@@ -8,11 +8,13 @@ import { getAcpRuntime, type AcpRuntime } from "../local_agent_runtime";
 import type { AcpRuntimeAdapter } from "./types";
 import { ClaudeCodeAdapter } from "./claude_code_adapter";
 import { CodexAdapter } from "./codex_adapter";
+import { OpenCodeAdapter } from "./opencode_adapter";
 
 // Re-export types and adapters
 export type { AcpRuntimeAdapter, SessionMetaParams } from "./types";
 export { ClaudeCodeAdapter } from "./claude_code_adapter";
 export { CodexAdapter } from "./codex_adapter";
+export { OpenCodeAdapter } from "./opencode_adapter";
 export { BaseAcpAdapter } from "./base_adapter";
 
 /**
@@ -22,6 +24,7 @@ export { BaseAcpAdapter } from "./base_adapter";
 const adapters: Record<AcpRuntime, AcpRuntimeAdapter> = {
   "claude-code": new ClaudeCodeAdapter(),
   codex: new CodexAdapter(),
+  opencode: new OpenCodeAdapter(),
 };
 
 /**

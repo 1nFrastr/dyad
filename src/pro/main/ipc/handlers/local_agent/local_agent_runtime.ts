@@ -8,7 +8,7 @@ export const LOCAL_AGENT_RUNTIMES = [
 
 export type LocalAgentRuntime = (typeof LOCAL_AGENT_RUNTIMES)[number];
 
-export const ACP_RUNTIMES = ["claude-code", "codex"] as const;
+export const ACP_RUNTIMES = ["claude-code", "codex", "opencode"] as const;
 
 export type AcpRuntime = (typeof ACP_RUNTIMES)[number];
 

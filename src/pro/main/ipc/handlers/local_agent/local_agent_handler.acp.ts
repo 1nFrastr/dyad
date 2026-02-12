@@ -504,29 +504,139 @@ export async function handleLocalAgentStream(
 
   // Get the appropriate adapter for the current runtime
   const adapter = getAcpAdapter(settings);
-  const acpEntrypoint = adapter.resolveEntrypoint();
-
   const spawnEnv = {
     ...process.env,
     ...adapter.getSpawnEnv(settings),
   };
 
-  const child = spawn(process.execPath, [acpEntrypoint], {
-    cwd: appPath,
-    stdio: ["pipe", "pipe", "pipe"],
-    env: spawnEnv,
+  // Check if adapter uses CLI command mode (e.g., OpenCode)
+  const spawnCommand = adapter.getSpawnCommand?.();
+  const spawnArgs = adapter.getSpawnArgs?.();
+
+  // Determine runtime info for logging
+  const runtimeInfo =
+    spawnCommand && spawnArgs
+      ? `${spawnCommand} ${spawnArgs.join(" ")}`
+      : adapter.resolveEntrypoint();
+
+  let child: ReturnType<typeof spawn> | null = null;
+  let stderrBuffer = "";
+  let spawnError: Error | null = null;
+
+  if (spawnCommand && spawnArgs) {
+    // CLI command mode: spawn the command directly with args
+    // e.g., spawn("opencode", ["acp"], ...)
+    child = spawn(spawnCommand, spawnArgs, {
+      cwd: appPath,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: spawnEnv,
+    });
+  } else {
+    // Node.js script mode: use Node.js to execute the entrypoint
+    const acpEntrypoint = adapter.resolveEntrypoint();
+    child = spawn(process.execPath, [acpEntrypoint], {
+      cwd: appPath,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: spawnEnv,
+    });
+  }
+
+  // Collect stderr for error reporting
+  if (child.stderr) {
+    child.stderr.on("data", (chunk) => {
+      const text = chunk.toString("utf8");
+      stderrBuffer += text;
+      const trimmed = text.trim();
+      if (trimmed) {
+        logger.debug(`[acp-runtime:stderr] ${trimmed}`);
+      }
+    });
+  }
+
+  // Handle spawn errors (e.g., command not found)
+  child.on("error", (err: Error) => {
+    logger.error(`[acp-runtime] spawn error: ${err.message}`);
+    spawnError = err;
+    // Send error to user
+    safeSend(event.sender, "chat:response:error", {
+      chatId: req.chatId,
+      error:
+        `Failed to start ${adapter.displayName} ACP runtime: ${err.message}\n` +
+        `Command: ${spawnCommand || process.execPath} ${(spawnArgs || [adapter.resolveEntrypoint()]).join(" ")}\n` +
+        `Make sure ${spawnCommand || "the runtime"} is installed and available in PATH.`,
+    });
   });
 
-  child.stderr.on("data", (chunk) => {
-    const text = chunk.toString("utf8").trim();
-    if (text) {
-      logger.debug(`[acp-runtime:stderr] ${text}`);
+  // Check if process spawned successfully
+  // If no PID, wait briefly for error event
+  if (!child.pid) {
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => resolve(), 500);
+      child.once("error", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      child.once("exit", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+
+    if (spawnError || !child.pid) {
+      const commandStr = spawnCommand
+        ? `${spawnCommand} ${spawnArgs?.join(" ") || ""}`
+        : `${process.execPath} ${adapter.resolveEntrypoint()}`;
+      const errorMsg = spawnError
+        ? (spawnError as Error).message
+        : "Process failed to start";
+      throw new Error(
+        `Failed to start ${adapter.displayName} ACP runtime.\n` +
+          `Command: ${commandStr}\n` +
+          `Error: ${errorMsg}\n` +
+          (stderrBuffer ? `Stderr: ${stderrBuffer}\n` : "") +
+          `Make sure ${spawnCommand || "the runtime"} is installed and available in PATH.`,
+      );
+    }
+  }
+
+  // At this point, child should be valid
+  if (!child || !child.pid) {
+    throw new Error(
+      `Failed to start ${adapter.displayName} ACP runtime: Process failed to start`,
+    );
+  }
+
+  // Track if process exited unexpectedly
+  let processExited = false;
+  let exitCode: number | null = null;
+  let exitSignal: NodeJS.Signals | null = null;
+
+  // Handle early exit (e.g., command not found, permission denied)
+  child.on("exit", (code, signal) => {
+    processExited = true;
+    exitCode = code;
+    exitSignal = signal;
+    if (code !== null && code !== 0 && !abortController.signal.aborted) {
+      const errorMsg = `[acp-runtime] process exited unexpectedly: code=${code}, signal=${signal}`;
+      logger.error(errorMsg);
+      if (stderrBuffer) {
+        logger.error(`[acp-runtime] stderr: ${stderrBuffer}`);
+      }
+      // Send error to user immediately
+      safeSend(event.sender, "chat:response:error", {
+        chatId: req.chatId,
+        error:
+          `${adapter.displayName} ACP runtime process exited unexpectedly.\n` +
+          `Exit code: ${code}\n` +
+          (signal ? `Signal: ${signal}\n` : "") +
+          (stderrBuffer ? `Error output:\n${stderrBuffer}` : ""),
+      });
     }
   });
 
   const stream = createAcpStreamWithLogging(
-    Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
-    Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
+    Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>,
+    Readable.toWeb(child.stdout!) as ReadableStream<Uint8Array>,
   );
 
   const client: Client = {
@@ -664,8 +774,12 @@ export async function handleLocalAgentStream(
   };
 
   logger.log(
-    `[acp-runtime] start chatId=${req.chatId} mode=${runtimeMode} runtime=${adapter.displayName} model=${settings.selectedModel.name} cwd=${appPath} adapter=${acpEntrypoint}`,
+    `[acp-runtime] start chatId=${req.chatId} mode=${runtimeMode} runtime=${adapter.displayName} model=${settings.selectedModel.name} cwd=${appPath} adapter=${runtimeInfo}`,
   );
+  logger.log(
+    `[acp-runtime] spawn command: ${spawnCommand || process.execPath} ${(spawnArgs || [adapter.resolveEntrypoint()]).join(" ")}`,
+  );
+  logger.log(`[acp-runtime] process PID: ${child.pid || "none"}`);
 
   try {
     if (abortController.signal.aborted) {
@@ -674,6 +788,12 @@ export async function handleLocalAgentStream(
 
     const initResponse = await connection.initialize({
       protocolVersion: 1,
+      clientCapabilities: {
+        fs: {
+          readTextFile: true,
+          writeTextFile: true,
+        },
+      },
       clientInfo: {
         name: "dyad",
         title: "Dyad",
@@ -681,8 +801,62 @@ export async function handleLocalAgentStream(
       },
     });
 
+    // Check if process exited during initialize
+    if (processExited) {
+      throw new Error(
+        `${adapter.displayName} ACP runtime process exited during initialize.\n` +
+          `Exit code: ${exitCode}\n` +
+          (exitSignal ? `Signal: ${exitSignal}\n` : "") +
+          (stderrBuffer ? `Error output:\n${stderrBuffer}` : ""),
+      );
+    }
+
+    // Verify agentInfo is present (required by some runtimes like OpenCode)
+    if (!initResponse.agentInfo) {
+      logger.warn(
+        `[acp-runtime] initialize response missing agentInfo, this may cause issues with some runtimes`,
+      );
+    }
+
     logger.log(
-      `[acp-runtime] initialized protocol=${initResponse.protocolVersion} agent=${initResponse.agentInfo?.name ?? "unknown"}@${initResponse.agentInfo?.version ?? "unknown"}`,
+      `[acp-runtime] initialized: protocolVersion=${initResponse.protocolVersion}, agent=${initResponse.agentInfo?.name ?? "unknown"}@${initResponse.agentInfo?.version ?? "unknown"}`,
+    );
+
+    // Build session meta with agent info if available (some runtimes like OpenCode may need it)
+    const sessionMeta = adapter.buildSessionMeta({
+      systemPrompt,
+      selectedModelName: settings.selectedModel.name,
+      disallowedTools,
+    });
+
+    // For OpenCode, ensure agent info is available in _meta
+    // OpenCode may need this for internal operations
+    if (adapter.id === "opencode" && initResponse.agentInfo) {
+      const opencodeMeta = (sessionMeta as any).opencode || {};
+
+      if (!opencodeMeta.options) {
+        opencodeMeta.options = {};
+      }
+      opencodeMeta.options.agent = {
+        name: initResponse.agentInfo.name,
+        version: initResponse.agentInfo.version,
+      };
+
+      opencodeMeta.agent = {
+        name: initResponse.agentInfo.name,
+        version: initResponse.agentInfo.version,
+      };
+
+      (sessionMeta as any).opencode = opencodeMeta;
+      (sessionMeta as any).agent = {
+        name: initResponse.agentInfo.name,
+        version: initResponse.agentInfo.version,
+      };
+      (sessionMeta as any).agentInfo = initResponse.agentInfo;
+    }
+
+    logger.log(
+      `[acp-runtime] creating session with meta keys: ${Object.keys(sessionMeta).join(", ")}`,
     );
 
     const sessionResponse = await connection.newSession({
@@ -690,22 +864,36 @@ export async function handleLocalAgentStream(
       // Do not inject Dyad-managed MCP servers for ACP runtime.
       // ACP runtimes use runtime-side MCP configuration.
       mcpServers: [],
-      _meta: adapter.buildSessionMeta({
-        systemPrompt,
-        selectedModelName: settings.selectedModel.name,
-        disallowedTools,
-      }),
+      _meta: sessionMeta,
     });
 
     sessionId = sessionResponse.sessionId;
 
-    try {
-      await connection.setSessionMode({
-        sessionId,
-        modeId: permissionMode,
-      });
-    } catch (error) {
-      logger.warn("[acp-runtime] setSessionMode failed", error);
+    // Check if process exited during newSession
+    if (processExited) {
+      throw new Error(
+        `${adapter.displayName} ACP runtime process exited during newSession.\n` +
+          `Exit code: ${exitCode}\n` +
+          (exitSignal ? `Signal: ${exitSignal}\n` : "") +
+          (stderrBuffer ? `Error output:\n${stderrBuffer}` : ""),
+      );
+    }
+
+    logger.log(
+      `[acp-runtime] session created: sessionId=${sessionId}, models=${JSON.stringify(sessionResponse.models?.availableModels?.map((m) => m.modelId))}`,
+    );
+
+    // Skip setSessionMode for OpenCode - it causes agent context to be lost
+    // which results in "TypeError: undefined is not an object (evaluating 'agent.name')"
+    if (adapter.id !== "opencode") {
+      try {
+        await connection.setSessionMode({
+          sessionId,
+          modeId: permissionMode,
+        });
+      } catch (error) {
+        logger.warn("[acp-runtime] setSessionMode failed", error);
+      }
     }
 
     const modelMatch = sessionResponse.models?.availableModels?.find(
@@ -720,7 +908,8 @@ export async function handleLocalAgentStream(
       },
     );
 
-    if (modelMatch) {
+    // Skip unstable_setSessionModel for OpenCode - it may also cause agent context loss
+    if (modelMatch && adapter.id !== "opencode") {
       try {
         await connection.unstable_setSessionModel({
           sessionId,
@@ -738,10 +927,37 @@ export async function handleLocalAgentStream(
       }
     });
 
+    // Check if process exited before prompt
+    if (processExited) {
+      throw new Error(
+        `${adapter.displayName} ACP runtime process exited before prompt.\n` +
+          `Exit code: ${exitCode}\n` +
+          (exitSignal ? `Signal: ${exitSignal}\n` : "") +
+          (stderrBuffer ? `Error output:\n${stderrBuffer}` : ""),
+      );
+    }
+
+    logger.log(
+      `[acp-runtime] sending prompt to session ${sessionId}, prompt length: ${(conversationPrompt || req.prompt).length}`,
+    );
+
     const promptResponse = await connection.prompt({
       sessionId,
       prompt: [{ type: "text", text: conversationPrompt || req.prompt }],
     });
+
+    // Check if process exited during prompt
+    if (processExited) {
+      logger.error(
+        `[acp-runtime] process exited during prompt: code=${exitCode}, signal=${exitSignal}`,
+      );
+      throw new Error(
+        `${adapter.displayName} ACP runtime process exited during prompt.\n` +
+          `Exit code: ${exitCode}\n` +
+          (exitSignal ? `Signal: ${exitSignal}\n` : "") +
+          (stderrBuffer ? `Error output:\n${stderrBuffer}` : ""),
+      );
+    }
 
     promptStopReason = promptResponse.stopReason;
 
